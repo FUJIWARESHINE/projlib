@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>项目库统计程序</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 4a2 2 0 0 1 2-2h6l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>
+          <path d="M9 13l2 2 4-4"/>
+        </svg>
+      </div>
+      <div>
+        <h1>项目库统计</h1>
+        <p>PROJECT LIBRARY</p>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="user-box" id="userBox"></div>
+    <div class="sidebar-foot">项目库管理 · 月末统计 · 多人协作</div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h2 id="pageTitle">仪表盘</h2>
+        <span class="sub" id="pageSub"></span>
+      </div>
+      <div class="topbar-actions" id="topActions"></div>
+    </header>
+    <div class="content" id="view"></div>
+  </div>
+</div>
+<div id="modalRoot"></div>
+<div class="toast-wrap" id="toastWrap"></div>
+<script src="core.js"></script>
+<script src="views.js"></script>
+<script>boot();</script>
+</body>
+</html>

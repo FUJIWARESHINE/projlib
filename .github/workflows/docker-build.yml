@@ -1,0 +1,149 @@
+name: Build Docker Image
+
+# 触发策略：
+#   1. 推 tag（形如 v1.0.1）→ 构建并发布「精确版本」镜像（多架构）
+#   2. 推 main 分支       → 构建 latest + edge（多架构），用于日常验证
+#   3. 手动触发          → 同 main
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: fujiwareshine/projlib
+  # 多架构平台：amd64（x86_64 NAS/PC）+ arm64（ARM NAS/树莓派/Apple Silicon）
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        # arm64 交叉构建必需：在 amd64 runner 上模拟 arm64 执行 RUN 指令
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---- 版本号解析 ----------------------------------------------------
+      # tag 推送 → 用 tag 名（v1.0.1）作为版本，同时打出版本 tag
+      # main 推送 → 用 0.0.0-<短SHA> 表示开发版，只打 latest / edge
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"          # v1.0.1 -> 1.0.1
+            echo "is_release=true"  >> "$GITHUB_OUTPUT"
+            echo "version=$VER"     >> "$GITHUB_OUTPUT"
+            echo "::notice::发布版本 $GITHUB_REF_NAME（版本号 $VER）"
+          else
+            SHORT="${GITHUB_SHA::7}"
+            echo "is_release=false"           >> "$GITHUB_OUTPUT"
+            echo "version=0.0.0-$SHORT"       >> "$GITHUB_OUTPUT"
+            echo "::notice::开发构建 $SHORT（latest + edge）"
+          fi
+
+      # ---- GHCR ---------------------------------------------------------
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (GHCR)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ steps.ver.outputs.version }},enable=${{ steps.ver.outputs.is_release == 'true' }}
+            type=raw,value=edge,enable=${{ steps.ver.outputs.is_release == 'false' }}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and push GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ===== Docker Hub 同步 =====
+      # 配置仓库密钥 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 后自动启用；未配置时自动跳过，不影响构建
+      - name: Check Docker Hub secrets
+        id: dh
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "repo=docker.io/${DH_USER}/projlib" >> "$GITHUB_OUTPUT"
+            echo "同步到 Docker Hub: ${DH_USER}/projlib"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，跳过 Docker Hub 同步"
+          fi
+
+      - name: Login to Docker Hub
+        if: steps.dh.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (Docker Hub)
+        id: dmeta
+        if: steps.dh.outputs.enabled == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.dh.outputs.repo }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ steps.ver.outputs.version }},enable=${{ steps.ver.outputs.is_release == 'true' }}
+            type=raw,value=edge,enable=${{ steps.ver.outputs.is_release == 'false' }}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and push Docker Hub
+        if: steps.dh.outputs.enabled == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.dmeta.outputs.tags }}
+          labels: ${{ steps.dmeta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本号 | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| 是否发布版 | ${{ steps.ver.outputs.is_release }} |"
+            echo "| 平台 | \`${{ env.PLATFORMS }}\` |"
+            if [[ "${{ steps.dh.outputs.enabled }}" == "true" ]]; then
+              echo "| Docker Hub | \`${{ steps.dh.outputs.repo }}\` |"
+            else
+              echo "| Docker Hub | 已跳过（未配 secret） |"
+            fi
+            echo "| GHCR | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

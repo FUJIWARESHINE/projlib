@@ -1,0 +1,19 @@
+.git
+.gitignore
+build/
+dist/
+data/
+.tmp-verify/
+.workbuddy/
+__pycache__/
+*.pyc
+*.db
+*.log
+*.spec
+*.old
+README.md
+build.py
+app/main.py
+app/icon.ico
+
+# 注意：不要排除 app/seed/（内置出厂数据必须进镜像）

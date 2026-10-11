@@ -1,0 +1,10 @@
+# 打包产物
+build/
+dist/
+data/
+__pycache__/
+*.pyc
+.tmp-verify/
+.workbuddy/
+*.db
+*.log

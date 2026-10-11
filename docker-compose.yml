@@ -1,0 +1,16 @@
+services:
+  projlib:
+    build: .
+    image: projlib:latest
+    container_name: projlib
+    restart: unless-stopped
+    ports:
+      # 左边是宿主机端口（可改），右边是容器内端口（保持 8775）
+      - "5666:8775"
+    volumes:
+      # 数据（数据库 + 导出文件）持久化到宿主机
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - PROJLIB_PORT=8775
+      - PROJLIB_DATA_DIR=/data
