@@ -139,10 +139,11 @@ def export_summary(rows: list, missing: list = None, title: str = "",
     ws.row_dimensions[2].height = 20
 
     # ---- 第 3 行：合计 + 说明
-    n_total = len({(r.get("ptype"), r.get("code")) for r in rows})
-    n_real = len({r["code"] for r in rows if r.get("ptype") == "real"})
-    n_pack = len({r["code"] for r in rows if r.get("ptype") in ("urgent", "stock")})
-    n_repair = len({r["code"] for r in rows if r.get("ptype") == "repair"})
+    # 按「行」计数：同一编号返修多次会列出多行，合计要和列出来的行数对得上
+    n_total = len(rows)
+    n_real = sum(1 for r in rows if r.get("ptype") == "real")
+    n_pack = sum(1 for r in rows if r.get("ptype") in ("urgent", "stock"))
+    n_repair = sum(1 for r in rows if r.get("ptype") == "repair")
     price_sum = round(sum((r.get("price") or 0) for r in rows if r.get("ptype") != "repair"), 2)
     note = (f"共参与项目 {n_total} 项，其中真实 {n_real} 项、压缩包 {n_pack} 项、返修 {n_repair} 项"
             + (f"，报价合计 {price_sum:,.0f} 元" if price_sum else ""))
@@ -302,7 +303,7 @@ def _write_stat_sheet(ws, rows: list, missing: list, title: str, platforms) -> N
     ws.row_dimensions[1].height = 42
     ws.row_dimensions[2].height = 20
 
-    n_total = len({(r.get("ptype"), r.get("code")) for r in rows})
+    n_total = len(rows)   # 按行计数，与下面列出的行数一致（同编号多次会列多行）
     price_sum = round(sum((r.get("price") or 0) for r in rows if r.get("ptype") != "repair"), 2)
     note = f"共 {n_total} 项" + (f"，报价合计 {price_sum:,.0f} 元" if price_sum else "")
     if missing:

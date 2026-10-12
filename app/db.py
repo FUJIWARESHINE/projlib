@@ -85,11 +85,14 @@ CREATE TABLE IF NOT EXISTS projects(
   audit_xu TEXT DEFAULT '',            -- 徐审核
   send_date TEXT DEFAULT '',           -- 发送日期
   note TEXT DEFAULT '',                -- 程序内备注
-  disc TEXT DEFAULT '',                -- 去重标识（同类型+编号+该列内容可并存多行）
+  disc TEXT DEFAULT '',                -- 分组标识（同类型+编号下，用该列内容区分多行）
+  seq INTEGER NOT NULL DEFAULT 0,      -- 同一 (类型,编号,disc) 组内的第几次出现（0 起）
   created_at TEXT,
   updated_at TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_projects ON projects(ptype, code, disc);
+-- 唯一键含 seq：允许「同类型 + 同编号 + 同内容」的多行并存
+-- （例如同一项目先后返修多次、返修要求文字完全相同，两行都要留）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_projects ON projects(ptype, code, disc, seq);
 
 CREATE TABLE IF NOT EXISTS meta(
   key TEXT PRIMARY KEY,
@@ -220,9 +223,27 @@ def tx():
         conn.close()
 
 
+def _migrate(conn) -> None:
+    """老库升级：补 seq 列，并把唯一索引从 (ptype,code,disc) 换成带 seq 的四列。
+
+    旧索引会阻止「同编号 + 同内容」的多行并存（同一项目多次返修会被吞掉），
+    所以必须换掉；存量数据 seq 默认 0，组内本来就只有一行，迁移后依然唯一。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+    if "seq" not in cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_projects'"
+    ).fetchone()
+    if row is not None and "seq" not in (row["sql"] or ""):
+        conn.execute("DROP INDEX IF EXISTS uq_projects")
+        conn.execute("CREATE UNIQUE INDEX uq_projects ON projects(ptype, code, disc, seq)")
+
+
 def init_db() -> None:
     with tx() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # ------------------------------------------------------------------ 项目
@@ -336,19 +357,36 @@ def find_by_codes(ptype: str, codes: list) -> list:
 
 
 def _disc_of(payload: dict) -> str:
-    """去重标识：同类型 + 同编号下，用「返修要求 / 报价说明」区分多行。
-    内容相同的重复行视为同一条（覆盖更新），不重复插入。"""
-    extra = str(payload.get("extra") or "").strip()
-    if not extra and str(payload.get("ptype")) == "repair":
-        return ""
-    return extra
+    """分组标识：同类型 + 同编号下，用「返修要求 / 报价说明」把多行分成若干组。
+
+    注意：**不再把「内容相同」当成同一条**。同一项目返修多次、要求文字一样
+    （例如都是「补实验」）时是两条真实记录，靠 seq 区分并存。
+    """
+    return str(payload.get("extra") or "").strip()
+
+
+def _default_seq(conn, ptype: str, code: str, disc: str,
+                 payload: dict) -> int:
+    """手工新增单条时决定 seq：显式给了就用给的，否则接在该组已有行后面。"""
+    if payload.get("seq") not in (None, ""):
+        try:
+            return int(payload["seq"])
+        except (TypeError, ValueError):
+            pass
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), -1) AS m FROM projects WHERE ptype=? AND code=? AND disc=?",
+        (ptype, code, disc),
+    ).fetchone()
+    return int(row["m"]) + 1
 
 
 def upsert_projects_bulk(rows: list) -> tuple:
     """批量 upsert（单连接单事务）。
 
-    与逐条 upsert_project 语义一致（按 ptype+code+disc 判存），但把 218 次
-    连接/提交压成 1 次，导入耗时从 ~24s 降到百毫秒级。
+    判存键 = (ptype, code, disc, seq)。导入时 seq 由 importer 按源表里
+    「同编号+同内容」的第几次出现算出，因此：
+      - 源表里两行完全相同的内容 → seq 不同 → 两行都保留；
+      - 同一份文件重复导入 → seq 相同 → 覆盖更新，不会翻倍。
     返回 (created, updated)。
     """
     if not rows:
@@ -362,7 +400,11 @@ def upsert_projects_bulk(rows: list) -> tuple:
         if not ptype or not code:
             continue
         disc = _disc_of(payload)
-        prepared.append((ptype, code, disc, {
+        try:
+            seq = int(payload.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        prepared.append((ptype, code, disc, seq, {
             "name": str(payload.get("name") or "").strip(),
             "src_row": int(payload.get("src_row") or 0),
             "cell": str(payload.get("cell") or ""), "mol": str(payload.get("mol") or ""),
@@ -382,10 +424,10 @@ def upsert_projects_bulk(rows: list) -> tuple:
     cols = ("name", "src_row", "cell", "mol", "path", "animal",
             "extra", "price", "audit_sun", "audit_xu", "send_date", "note")
     with tx() as conn:
-        for ptype, code, disc, fields in prepared:
+        for ptype, code, disc, seq, fields in prepared:
             row = conn.execute(
-                "SELECT id FROM projects WHERE ptype=? AND code=? AND disc=?",
-                (ptype, code, disc),
+                "SELECT id FROM projects WHERE ptype=? AND code=? AND disc=? AND seq=?",
+                (ptype, code, disc, seq),
             ).fetchone()
             if row:
                 sets = ", ".join(f"{k}=?" for k in cols)
@@ -395,17 +437,24 @@ def upsert_projects_bulk(rows: list) -> tuple:
                 )
                 updated += 1
             else:
-                collist = ", ".join(("ptype", "code", "disc") + cols + ("updated_at",))
-                marks = ", ".join("?" * (3 + len(cols) + 1))
+                collist = ", ".join(("ptype", "code", "disc", "seq") + cols + ("updated_at",))
+                marks = ", ".join("?" * (4 + len(cols) + 1))
                 conn.execute(
                     f"INSERT INTO projects ({collist}) VALUES ({marks})",
-                    [ptype, code, disc] + [fields[k] for k in cols] + [now],
+                    [ptype, code, disc, seq] + [fields[k] for k in cols] + [now],
                 )
                 created += 1
     return created, updated
 
 
 def upsert_project(payload: dict) -> int:
+    """手工新增/更新单条。
+
+    - 带 seq（或库里已有同组行）→ 按 (ptype, code, disc, seq) 定位；
+    - 未带 seq 且该组已存在 → seq 取组内最大值 +1，**新增一次出现**，
+      而不是覆盖旧行（同一项目多次返修/多次报价都必须留下）。
+      想改已有那条，请走 PUT /api/projects/<id> 的编辑弹窗。
+    """
     ptype = (payload.get("ptype") or "").strip()
     code = str(payload.get("code") or "").strip()
     if not ptype or not code:
@@ -425,8 +474,10 @@ def upsert_project(payload: dict) -> int:
         "note": str(payload.get("note") or ""),
     }
     with tx() as conn:
+        seq = _default_seq(conn, ptype, code, disc, payload)
         row = conn.execute(
-            "SELECT id FROM projects WHERE ptype=? AND code=? AND disc=?", (ptype, code, disc)
+            "SELECT id FROM projects WHERE ptype=? AND code=? AND disc=? AND seq=?",
+            (ptype, code, disc, seq),
         ).fetchone()
         if row:
             sets = ", ".join(f"{k}=?" for k in fields if k not in ("ptype", "code", "disc"))
@@ -436,11 +487,11 @@ def upsert_project(payload: dict) -> int:
                 args + [_now(), row["id"]],
             )
             return row["id"]
-        keys = list(fields.keys())
+        keys = list(fields.keys()) + ["seq"]
         conn.execute(
             f"INSERT INTO projects({','.join(keys)},created_at,updated_at) "
             f"VALUES({','.join('?' * len(keys))},?,?)",
-            [fields[k] for k in keys] + [_now(), _now()],
+            [fields[k] for k in fields] + [seq, _now(), _now()],
         )
         return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 

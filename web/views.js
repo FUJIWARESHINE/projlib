@@ -212,7 +212,7 @@ function platRow(p) {
    存 localStorage["projlib.col_w"]（只记录手动调过的列）。 */
 const BROWSE_COLS = [
   ["type", "类型", 76, 56],
-  ["code", "编号", 88, 64],
+  ["code", "编号", 104, 72],
   ["name", "项目名", 360, 120],
   ["cell", "细胞", 74, 52],
   ["mol", "分子", 74, 52],
@@ -401,7 +401,10 @@ VIEWS.browse = async (root) => {
               const note = r.note || (r.ptype === "repair" ? r.extra : "");
               return `<tr data-id="${r.id}">
               <td>${typePill(r.ptype)}</td>
-              <td><span class="code-cell">${esc(r.code)}</span></td>
+              <td><span class="code-cell">${esc(r.code)}</span>${
+                (r.seq || 0) > 0
+                  ? `<span class="pill pill-times" title="同一编号的第 ${r.seq + 1} 次记录（如同一个项目多次返修）">×${r.seq + 1}</span>`
+                  : ""}</td>
               <td><span class="name-cell" title="${esc(r.name)}">${esc(r.name)}</span></td>
               ${PLAT_COLS.map((p) => `<td class="plat">${stCell(r.id, p, r[p])}</td>`).join("")}
               <td><span class="price-cell" title="${esc(r.extra)}">${price}</span></td>
@@ -667,17 +670,23 @@ VIEWS.import = async (root) => {
 
   function showImported(d) {
     const labelMap = { real: "真实", urgent: "加急", stock: "库存", repair: "返修" };
+    const reps = Object.entries(d.repeats || {});
+    const repTip = reps.length
+      ? `<div class="hint" style="margin-top:8px">其中 ${reps.length} 个编号在表里出现多次
+         （同一项目多次返修 / 多行报价），已<b>全部保留</b>，没有丢行：
+         ${reps.slice(0, 8).map(([c, n]) => `${esc(c)}×${n + 1}`).join("、")}${reps.length > 8 ? " …" : ""}</div>`
+      : "";
     $("#previewCard").style.display = "";
     $("#previewBody").innerHTML = `
       <div class="notice info" style="margin-bottom:12px"><span>✅</span>
-        <div>导入完成：新增 <b>${d.created||0}</b> 条，更新 <b>${d.updated||0}</b> 条。</div></div>
+        <div>导入完成：新增 <b>${d.created||0}</b> 条，更新 <b>${d.updated||0}</b> 条${d.total_rows ? `，共处理 <b>${d.total_rows}</b> 行` : ""}。</div></div>
       <div class="sheet-preview">
         ${Object.entries(d.by_type || {}).map(([k, n]) => `
           <div class="sheet-card">
             <h4>${typePill(k)} ${esc(labelMap[k] || k)}</h4>
             <div class="n">${n}</div><div class="lbl">条记录</div>
           </div>`).join("")}
-      </div>`;
+      </div>${repTip}`;
     loadInfo();
   }
 

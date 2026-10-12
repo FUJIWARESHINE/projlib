@@ -308,8 +308,13 @@ def _save_upload(body):
     filename = body.get("filename") or "import.xlsx"
     if not content:
         return fail("未收到文件内容")
+    # openpyxl 按扩展名判断格式，源文件名没有 .xlsx 时要补上，
+    # 否则会报 "does not support  file format" 这种看不懂的错误
+    fname = os.path.basename(filename)
+    if not fname.lower().endswith((".xlsx", ".xlsm")):
+        fname += ".xlsx"
     tmp_dir = tempfile.mkdtemp(prefix="projlib_")
-    tmp_path = os.path.join(tmp_dir, os.path.basename(filename))
+    tmp_path = os.path.join(tmp_dir, fname)
     try:
         with open(tmp_path, "wb") as f:
             f.write(base64.b64decode(content.split(",")[-1]))

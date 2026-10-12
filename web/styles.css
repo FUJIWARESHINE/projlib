@@ -545,6 +545,11 @@ input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
 .pill.urgent { background: #ffedd5; color: #c2410c; }
 .pill.stock  { background: #e0f2fe; color: #0369a1; }
 .pill.repair { background: #f3e8ff; color: #7e22ce; }
+/* 同编号的第 N 次记录（同一项目多次返修/多次报价）—— 定高小角标，别撑行高 */
+.pill-times {
+  background: #fef3c7; color: #b45309; margin-left: 5px;
+  padding: 0 6px; font-size: 10.5px; line-height: 16px; vertical-align: middle;
+}
 
 /* ---------------- 平台状态点 ---------------- */
 .st { display: inline-flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1; }

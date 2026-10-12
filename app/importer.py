@@ -168,8 +168,12 @@ def parse_workbook(path: str) -> dict:
 def import_workbook(path: str, mode: str = "upsert", source_label: str = "") -> dict:
     """导入 xlsx 到数据库。
 
-    mode = "upsert"（默认，按 类型+编号 覆盖更新）
+    mode = "upsert"（默认，按 类型+编号+内容+第几次出现 覆盖更新）
     mode = "rebuild"（先清空再全量写入）
+
+    ★ 不再做「同编号 + 同内容」的行级去重：
+      同一项目先后返修多次（连返修要求文字都相同）是两条真实记录，必须都留下。
+      靠 seq（该组内的第几次出现）保证「同一份文件重复导入」不会翻倍。
     """
     parsed = parse_workbook(path)
     data = parsed["data"]
@@ -177,22 +181,22 @@ def import_workbook(path: str, mode: str = "upsert", source_label: str = "") -> 
         return {"ok": False, "error": "未识别到任何 sheet（应包含 真实 / 加急 / 返修 / 库存 类）"}
 
     created = updated = 0
-    skipped = {}
+    repeat_groups = {}
     if mode == "rebuild":
         with db.tx() as conn:
             conn.execute("DELETE FROM projects")
     batch = []
     for ptype, rows in data.items():
-        seen = set()
+        counter = {}
         for row in rows:
             key = (row["code"], (row.get("extra") or "").strip())
-            if key in seen:
-                # 同类型 + 同编号 + 同内容：视为重复行，跳过（不重复入库）
-                skipped[row["code"]] = skipped.get(row["code"], 0) + 1
-                continue
-            seen.add(key)
+            seq = counter.get(key, 0)
+            counter[key] = seq + 1
+            row["seq"] = seq
+            if seq:
+                repeat_groups[row["code"]] = repeat_groups.get(row["code"], 0) + 1
             batch.append(dict(row))
-    # 单事务批量写入（218 条也只需一次连接/提交，避免逐条 fsync 拖慢到几十秒）
+    # 单事务批量写入（一次连接/提交，避免逐条 fsync 拖慢到几十秒）
     created, updated = db.upsert_projects_bulk(batch)
     db.set_meta("source_file", source_label or path)
     db.set_meta("last_import", __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -200,7 +204,11 @@ def import_workbook(path: str, mode: str = "upsert", source_label: str = "") -> 
         "ok": True,
         "created": created,
         "updated": updated,
-        "skipped": skipped,
+        # 兼容旧字段名：现在不再丢行，恒为空
+        "skipped": {},
+        # 同编号+同内容的重复出现（已全部保留），供前端提示
+        "repeats": repeat_groups,
+        "total_rows": len(batch),
         "sheets": parsed["sheets"],
         "by_type": {k: len(v) for k, v in data.items()},
     }
