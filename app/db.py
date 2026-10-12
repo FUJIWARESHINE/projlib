@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -39,6 +40,32 @@ PLATFORMS = [
 ]
 PLATFORM_KEYS = [k for k, _ in PLATFORMS]
 PLATFORM_LABEL = dict(PLATFORMS)
+
+# 项目编号前缀（二十八期）：项目库里的编号一律是「字母前缀 + 数字」，如 A539 / A1000。
+# 实验员填报时若只写了数字（539）就会被拦下来，提醒补全前缀。
+# 规则只要求**以字母开头**（A、B、C… 都行，不写死某个字母），
+# 因为后续可能新增 B/C 系列编号，写死 A 反而会误伤。
+CODE_PREFIX_RE = re.compile(r"^[A-Za-z]")
+
+
+def has_code_prefix(code) -> bool:
+    """编号是否带字母前缀（A539 → True，539 → False，空 → False）。"""
+    return bool(CODE_PREFIX_RE.match(str(code or "").strip()))
+
+
+def codes_without_prefix(codes) -> list:
+    """挑出没有字母前缀的编号（去重、转大写、保持原顺序），供前后端提示用。"""
+    seen, out = set(), []
+    for c in codes or []:
+        s = str(c or "").strip()
+        if not s or has_code_prefix(s):
+            continue
+        key = s.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
 
 # 注册时可选的岗位：前四个是实验平台（可填自己板块），
 # 运营 / 设计 为只读岗位（全程只能查看，不能填任何板块）。

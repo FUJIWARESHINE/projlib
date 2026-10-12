@@ -17,6 +17,7 @@ const state = {
 
 const TYPE_CLASS = { real: "t-real", urgent: "t-urgent", stock: "t-stock", repair: "t-repair" };
 const TYPE_PILL = { real: "real", urgent: "urgent", stock: "stock", repair: "repair" };
+const TYPE_LABEL = { real: "真实", urgent: "加急", stock: "库存", repair: "返修" };
 const PLATFORM_LABEL = { cell: "细胞", mol: "分子", path: "病理", animal: "动物",
                           ops: "运营", design: "设计" };
 
@@ -143,6 +144,51 @@ function closeModal() {
   const cb = _modalCloseCb;      // 关闭钩子：用于「用户取消」时回调（如导出目标选择）
   _modalCloseCb = null;
   if (cb) cb();
+}
+
+/* 轻量提醒弹窗，**可以叠在已有弹窗之上**（openModal 会清空 #modalRoot，
+   所以这里直接挂 body，并用 capture 阶段拦掉 Esc，免得连带把底下的弹窗关掉、
+   把用户刚填的内容弄丢）。关闭后 resolve，方便调用方 await。 */
+function alertDialog(title, bodyHtml, okText = "知道了") {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "mask mask-stack";
+    wrap.innerHTML = `
+      <div class="modal" style="width:460px">
+        <div class="modal-head">
+          <h3>${esc(title)}</h3>
+          <button class="modal-close" data-ok>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">${bodyHtml}</div>
+        <div class="modal-foot"><button class="btn btn-primary" data-ok>${esc(okText)}</button></div>
+      </div>`;
+    document.body.appendChild(wrap);
+    let closed = false;
+    const done = () => {
+      if (closed) return;
+      closed = true;
+      wrap.remove();
+      document.removeEventListener("keydown", onKey, true);
+      resolve();
+    };
+    const onKey = (e) => {
+      if (e.key !== "Escape" && e.key !== "Enter") return;
+      // 光标还在文本框里时，回车留给换行，不抢
+      const tag = (document.activeElement || {}).tagName || "";
+      if (e.key === "Enter" && (tag === "TEXTAREA" || tag === "INPUT")) return;
+      e.preventDefault();
+      e.stopPropagation();      // capture 阶段掐断，别让底层弹窗的 Esc 也跟着触发
+      done();
+    };
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap || e.target.closest("[data-ok]")) done();
+    });
+    document.addEventListener("keydown", onKey, true);
+    const okBtn = wrap.querySelector(".modal-foot [data-ok]");
+    if (okBtn) okBtn.focus();
+  });
 }
 
 /* ------------------------------------------------ 导航 */

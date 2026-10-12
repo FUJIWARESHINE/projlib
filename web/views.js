@@ -854,16 +854,49 @@ function renderMonthList() {
   }));
 }
 
-async function loadMonth() {
+/* 重新渲染后把滚动位置还原。
+   —— 拖动 / 编辑 / 删除这类「原地操作」绝不能把页面弹回顶部：
+      ① 记下被操作那条编号此刻的视口位置，渲染后把它对回原位（跨平台拖动导致卡片高度变化也能对准）；
+      ② 记不住锚点（比如整条被删了）就退回原来的 scrollTop，超出新内容高度时浏览器会自动收敛；
+      ③ 只有「切换月份 / 进入页面」才回顶部。 */
+function restoreMonthScroll(inPlace, anchorEid, anchorTop, keepTop) {
+  const scroller = $("#view");
+  if (!scroller) return;
+  if (!inPlace) { scroller.scrollTop = 0; return; }
+  if (anchorEid && anchorTop != null) {
+    const el = document.querySelector(`.entry-row[data-eid="${anchorEid}"]`);
+    if (el) {
+      scroller.scrollTop += el.getBoundingClientRect().top - anchorTop;
+      return;
+    }
+  }
+  scroller.scrollTop = keepTop;
+}
+
+/* 拉取并渲染月份详情。
+   opts.inPlace   —— 原地操作（拖动/编辑/删除/锁定）：**不清空旧内容**，等新数据回来一次性替换，
+                     避免内容瞬间塌陷导致滚动条被顶到顶部，也不会闪一下「加载中…」。
+   opts.anchorEid —— 原地操作时被改的那条记录 id，用于把它的视口位置对回原位。 */
+async function loadMonth(opts = {}) {
   const wrap = $("#monthMain");
   if (!wrap) return;
-  wrap.innerHTML = '<div class="loading">加载中…</div>';
+  const inPlace = !!opts.inPlace;
+  const anchorEid = Number(opts.anchorEid) || 0;
+  const scroller = $("#view");
+  const keepTop = scroller ? scroller.scrollTop : 0;
+  const anchorEl = anchorEid
+    ? document.querySelector(`.entry-row[data-eid="${anchorEid}"]`) : null;
+  const anchorTop = anchorEl ? anchorEl.getBoundingClientRect().top : null;
+
+  if (!inPlace) wrap.innerHTML = '<div class="loading">加载中…</div>';
   let d;
   try {
     const r = await api("/api/months/" + state.month.mid);
     d = r.data;
     state.month.detail = d;
   } catch (e) {
+    // 原地刷新失败时保留旧内容，只弹提示，别把用户正在看的表换成错误页
+    if (inPlace) { toast(e.message, "error"); return; }
     wrap.innerHTML = `<div class="empty"><p>${esc(e.message)}</p></div>`;
     return;
   }
@@ -900,6 +933,7 @@ async function loadMonth() {
       ${d.platforms.map((p) => platCard(p, d, locked)).join("")}
     </div>`;
   equalizeCards();
+  restoreMonthScroll(inPlace, anchorEid, anchorTop, keepTop);
 
   if (admin) {
     $("#btnExportMonth").addEventListener("click", () => exportMonth(month));
@@ -908,7 +942,7 @@ async function loadMonth() {
       try {
         await api(`/api/months/${month.id}/lock`, { method: "POST", body: { locked: !locked } });
         toast(locked ? "已解锁填报" : "已锁定填报");
-        loadMonth();
+        loadMonth({ inPlace: true });
       } catch (e) { toast(e.message, "error"); }
     });
     $("#btnDelMonth").addEventListener("click", async () => {
@@ -932,7 +966,7 @@ async function loadMonth() {
       try {
         await api(`/api/months/${month.id}/entries/${btn.dataset.delentry}`,
           { method: "DELETE" });
-        toast("已移除"); loadMonth();
+        toast("已移除"); loadMonth({ inPlace: true });
       } catch (e) { toast(e.message, "error"); }
     });
   });
@@ -1101,7 +1135,7 @@ document.addEventListener("drop", async (e) => {
     const dd = r.data || {};
     if (dd.unchanged) return;
     toast(`已移动到「${dd.platform_label || platform} · ${dd.type_label || ""}」`);
-    loadMonth();
+    loadMonth({ inPlace: true, anchorEid: eid });   // 别把页面弹回顶部
   } catch (err) { toast(err.message, "error"); }
 });
 
@@ -1142,7 +1176,8 @@ function entryCodesDialog(platform, mode) {
              某个类型框清空即表示该类型下没有编号。`
           : `向 <b>${esc(platLabel)}</b> 平台一次性添加当月完成的编号：<b>四类可同时填写</b>，
              哪个类型下有编号就填在对应框里（用不到的留空即可）。`}
-          <br>每行一个编号，也可用逗号 / 空格分隔；编号不区分大小写（填 <code>a384</code> 也能匹配到 <code>A384</code>）。</div></div>
+          <br>每行一个编号，也可用逗号 / 空格分隔；编号不区分大小写（填 <code>a384</code> 也能匹配到 <code>A384</code>）。
+          <br><b>编号必须带字母前缀</b>，如 <code>A539</code>；只写数字（<code>539</code>）保存时会提示补全。</div></div>
       <div class="type-grid">
         ${TYPES.map(([k, l]) => {
           const cur = codesOf(k);
@@ -1192,6 +1227,8 @@ function entryCodesDialog(platform, mode) {
           const p = ta.selectionStart;
           ta.value = ta.value.toUpperCase();
           ta.setSelectionRange(p, p);
+          const col = ta.closest(".type-col");   // 补全前缀后自动取消标红
+          if (col && !codesWithoutPrefix(splitCodes(ta.value)).length) col.classList.remove("has-bad");
           refresh();
         });
       });
@@ -1205,6 +1242,13 @@ function entryCodesDialog(platform, mode) {
         }));
         const groups = cur.filter((g) => g.codes.length);
         if (!editing && !groups.length) return toast("请至少在一个类型下填写编号", "warn");
+
+        // 编号必须带字母前缀（A539）；只写数字（539）就弹窗提醒，补全前不许保存
+        const badItems = [];
+        cur.forEach((g) => codesWithoutPrefix(g.codes)
+          .forEach((c) => badItems.push({ ptype: g.ptype, code: c })));
+        if (badItems.length) return prefixAlertDialog(badItems, root);
+        $$(".type-col", root).forEach((c) => c.classList.remove("has-bad"));
 
         if (editing) {
           if (snapshot(cur) === beforeSig) { closeModal(); return toast("编号没有变化"); }
@@ -1250,7 +1294,7 @@ function entryCodesDialog(platform, mode) {
             closeModal();
             toast(`已添加 ${added} 个编号` + (skipped && skipped.length ? `，${skipped.length} 个已存在` : ""));
           }
-          loadMonth();
+          loadMonth({ inPlace: true });   // 弹窗保存后不跳回顶部
         } catch (e) { btn.disabled = false; toast(e.message, "error"); }
       });
     },
@@ -1313,6 +1357,14 @@ function editEntryDialog(entryId) {
       $("[data-save]", root).addEventListener("click", async () => {
         const code = codeEl.value.trim();
         if (!code) return toast("请输入项目编号", "warn");
+        const missing = codesWithoutPrefix([code]);
+        if (missing.length) {          // 同样要求带字母前缀（如 A539）
+          await alertDialog("请添加项目编号前缀", prefixBadHtml(
+            missing.map((c) => ({ ptype: $("#eeType", root).value, code: c }))));
+          codeEl.focus();
+          codeEl.select();
+          return;
+        }
         const ptype = $("#eeType", root).value;
         const platform = $("#eePlat", root).value;
         const btn = $("[data-save]", root);
@@ -1325,7 +1377,7 @@ function editEntryDialog(entryId) {
           const dd = r.data || {};
           if (dd.unchanged) return;
           toast(`已更新：${(dd.entry || {}).code} · ${dd.type_label || ""}`);
-          loadMonth();
+          loadMonth({ inPlace: true, anchorEid: entryId });
         } catch (e) { btn.disabled = false; toast(e.message, "error"); }
       });
     },
@@ -1338,6 +1390,55 @@ function splitCodes(text) {
     .split(/[\s,，;；、|]+/)
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
+}
+
+/* 项目编号必须带字母前缀（A539 / B12 …）。只写成数字（539）就是不完整。
+   规则只要求「以字母开头」，不写死某个字母 —— 以后新增 B/C 系列不用改代码。
+   与后端 db.has_code_prefix() 同规则，服务端还有一道兜底。 */
+function codesWithoutPrefix(codes) {
+  const seen = new Set(), out = [];
+  (codes || []).forEach((c) => {
+    const s = String(c || "").trim();
+    if (!s || /^[A-Za-z]/.test(s)) return;
+    const k = s.toUpperCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(k);
+  });
+  return out;
+}
+
+/* 弹窗提醒「请添加项目编号前缀」：问题编号逐个列出，对应类型框标红，
+   关掉弹窗后光标自动落到第一个问题编号上（选中，直接重打就行）。 */
+function prefixBadHtml(badItems) {
+  const uniq = [...new Set(badItems.map((b) => b.code))];
+  const detail = badItems
+    .map((b) => `<span class="code-bad">${esc(b.code)}</span>
+        <span style="font-size:12px;color:var(--text3)">（${esc(TYPE_LABEL[b.ptype] || b.ptype)}）</span>`)
+    .join("");
+  return `
+    <div class="notice warn" style="margin-bottom:12px"><span>⚠️</span>
+      <div>下面这 ${uniq.length} 个编号<b>缺少字母前缀</b>，不是完整编号，
+        补全后才能保存（例如 <code>539</code> 要写成 <code>A539</code>）：</div></div>
+    <div class="code-bad-list">${detail}</div>
+    <div style="margin-top:12px;font-size:12px;color:var(--text3)">
+      项目库里的编号都是「字母 + 数字」格式，如 A539、A1000。</div>`;
+}
+
+async function prefixAlertDialog(badItems, root) {
+  $$(".type-col", root).forEach((c) => c.classList.remove("has-bad"));
+  badItems.forEach((b) => {
+    const ta = $(`.type-input[data-ptype="${b.ptype}"]`, root);
+    if (ta) ta.closest(".type-col").classList.add("has-bad");
+  });
+  await alertDialog("请添加项目编号前缀", prefixBadHtml(badItems));
+  const first = badItems[0];
+  if (!first) return;
+  const ta = $(`.type-input[data-ptype="${first.ptype}"]`, root);
+  if (!ta) return;
+  ta.focus();
+  const at = ta.value.toUpperCase().indexOf(first.code);
+  if (at >= 0) ta.setSelectionRange(at, at + first.code.length);
 }
 
 function newMonthDialog() {
@@ -1385,7 +1486,7 @@ async function refreshMonthAll() {
     state.month.list = r.data.months || [];
   } catch (e) { /* 列表拉取失败也继续刷新详情 */ }
   renderMonthList();
-  await loadMonth();
+  await loadMonth({ inPlace: true });
 }
 
 /* 编辑统计月份：建错月份（9 月建成 10 月）时直接改回来，已填报的编号全部保留 */
@@ -1456,7 +1557,7 @@ async function exportMonth(month) {
     if (target === "local") triggerDownload(d.path, d.name);
     toast(target === "local" ? `已导出 ${d.total} 项，正在下载到本机` : `已导出 ${d.total} 项到服务器`);
     showExportDone(d, target);
-    loadMonth();
+    loadMonth({ inPlace: true });
   } catch (e) { toast(e.message, "error"); }
   finally { if (btn) btn.disabled = false; }
 }

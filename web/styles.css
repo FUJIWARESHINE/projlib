@@ -914,6 +914,20 @@ body.col-resizing .col-rs::after { background: var(--primary); top: 0; bottom: 0
 .type-grid .type-input:focus { outline: none; box-shadow: none; }
 .type-col:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
 
+/* 编号缺前缀时的提示（二十八期）：整个类型框标红 + 弹窗里列问题编号 */
+.type-col.has-bad {
+  border-color: var(--red); background: #fffafa;
+  box-shadow: 0 0 0 3px rgba(220,38,38,.12);
+}
+.code-bad-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 0; }
+.code-bad {
+  display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 8px;
+  background: var(--red-bg); color: var(--red); font-weight: 600; font-size: 13px;
+  font-family: Consolas, "Courier New", monospace;
+}
+/* 提示弹窗要盖在已有弹窗之上 */
+.mask.mask-stack { z-index: 1200; }
+
 .ro-tag { font-size: 12px; color: var(--text3); padding: 6px 12px; background: var(--gray-bg); border-radius: 8px; }
 .pill.admin { background: #ede9fe; color: #6d28d9; }
 

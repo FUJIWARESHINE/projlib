@@ -102,8 +102,10 @@ def ok(data=None, **extra):
     return payload
 
 
-def fail(msg: str, code: int = 400):
-    return {"ok": False, "error": msg}, code
+def fail(msg: str, code: int = 400, **extra):
+    payload = {"ok": False, "error": msg}
+    payload.update(extra)
+    return payload, code
 
 
 def api_logout(_q, _b):
@@ -124,6 +126,19 @@ def _split_codes(text: str) -> list:
         seen.add(p)
         out.append(p)
     return out
+
+
+def _prefix_fail(codes):
+    """编号缺字母前缀（如把 A539 填成 539）时的统一 400 响应。
+
+    前端弹窗会先拦一道，这里是服务端兜底 —— 绕过页面直接 POST 也拦得住。
+    返回 None 表示全部合格。响应里带 codes 字段，前端可直接列出问题编号。
+    """
+    bad = db.codes_without_prefix(codes)
+    if not bad:
+        return None
+    shown = "、".join(bad[:8]) + ("…" if len(bad) > 8 else "")
+    return fail(f"请添加项目编号前缀（{shown}）", 400, codes=bad)
 
 
 # ------------------------------------------------------------------ 业务
@@ -580,6 +595,10 @@ def api_month_add_entries(_q, body, mid, ctx):
     if not norm:
         return fail("请至少填写一个编号", 400)
 
+    _bad = _prefix_fail([c for _pt, cs in norm for c in cs])
+    if _bad:
+        return _bad          # 编号必须带字母前缀（如 A539），否则拒绝保存
+
     uid = user.get("id") or 0
     total_added, all_skipped, by_type = 0, [], {}
     try:
@@ -630,6 +649,10 @@ def api_month_sync_entries(_q, body, mid, ctx):
     if not norm:
         return fail("请至少提交一个类型", 400)
 
+    _bad = _prefix_fail([c for _pt, cs in norm for c in cs])
+    if _bad:
+        return _bad          # 编号必须带字母前缀（如 A539），否则拒绝保存
+
     try:
         r = db.sync_entries(mid, platform, norm, user_id=user.get("id") or 0)
         r["platform_label"] = db.PLATFORM_LABEL.get(platform, platform)
@@ -678,6 +701,10 @@ def api_month_move_entry(_q, body, mid, eid, ctx):
     code = str(raw_code).strip() if raw_code is not None else ""
     if raw_code is not None and not code:
         return fail("项目编号不能为空", 400)   # 明确传了空编号 = 非法（不传才是「不改」）
+    if raw_code is not None:
+        _bad = _prefix_fail([code])
+        if _bad:
+            return _bad      # 单条改编号也要带字母前缀（拖动只改归类、不带 code，不受影响）
     if platform not in db.PLATFORM_KEYS:
         return fail("平台不合法", 400)
     if ptype not in db.TYPE_NAME:
