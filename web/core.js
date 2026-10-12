@@ -10,7 +10,7 @@ const state = {
   dash: null,
   me: null,                 // 当前登录用户
   browse: { ptype: "", search: "", page: 1, page_size: 50, data: null, loading: false,
-            platform: "", status: "", order: "asc" },
+            platform: "", status: "", order: "asc", sort: "code", group: "type" },
   import: { preview: null, path: "", busy: false },
   month: { mid: 0, detail: null, list: [] },
 };
@@ -30,8 +30,10 @@ function loadPref(key, def) {
     return v === null ? def : v;
   } catch (e) { return def; }
 }
-// 项目库排序偏好：进页面时读取
+// 项目库排序偏好：进页面时读取（sort = 排序依据，order = 方向，group = 是否按类型分组）
 state.browse.order = loadPref("browse_order", "asc");
+state.browse.sort = loadPref("browse_sort", "code");
+state.browse.group = loadPref("browse_group", "type");
 
 /* ------------------------------------------------ 脱敏展示 */
 /* 界面上不直接暴露用户本机的源文件名，改为「主名…扩展名」的模糊形式。

@@ -251,9 +251,33 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# 排序表达式：先按类型分组（真实→加急→库存→返修），再按所选维度
+#   code → 按编号（A99 排在 A100 前面，用长度再字典序，避免字符串比较的坑）
+#   src  → 按源表录入顺序（保序，导入后与 Excel 行序一致）
+_CODE_ORDER = ("UPPER(SUBSTR(code,1,1)) {d}, LENGTH(code) {d}, UPPER(code) {d}")
+
+
+def _order_sql(sort: str, direction: str, group: str = "type") -> str:
+    """排序 SQL。
+
+    group="type" → 先按类型分组（真实→加急→库存→返修），组内再按所选维度；
+    group="all"  → 不分组，全局按所选维度排（编号就是唯一坐标，
+                   A393 直接排到 393 该在的位置，不管它属于哪个类型）。
+    """
+    head = ""
+    if str(group).lower() != "all":
+        head = ("CASE ptype WHEN 'real' THEN 0 WHEN 'urgent' THEN 1 "
+                "WHEN 'stock' THEN 2 ELSE 3 END, ")
+    if str(sort).lower() == "src":
+        return f"ORDER BY {head}src_row {direction}, id {direction}"
+    code_part = _CODE_ORDER.format(d=direction)
+    return f"ORDER BY {head}{code_part}, id {direction}"
+
+
 def list_projects(ptype: str = "", search: str = "", platform: str = "",
                   status: str = "", page: int = 1, page_size: int = 50,
-                  order: str = "asc") -> dict:
+                  order: str = "asc", sort: str = "code",
+                  group: str = "type") -> dict:
     """按条件分页查询项目库。
 
     status 语义（配合 platform，二者需同时给出）：
@@ -286,11 +310,10 @@ def list_projects(ptype: str = "", search: str = "", platform: str = "",
                 where.append(f"COALESCE({c},'')=?")
                 args.append(status)
     sql_where = ("WHERE " + " AND ".join(where)) if where else ""
-    # 排序：默认按类型分组 + 源表行序（保序）；
-    # 倒序时同类型内按 src_row 反向，便于直接看最新的编号。
+    # 排序：默认按类型分组 + 编号（A99 < A100，符合项目库直觉）；
+    # sort="src" 按源表录入顺序；group="all" 不分组、全局混排。
     dir_sql = "DESC" if str(order).lower() == "desc" else "ASC"
-    order_sql = ("ORDER BY CASE ptype WHEN 'real' THEN 0 WHEN 'urgent' THEN 1 "
-                 f"WHEN 'stock' THEN 2 ELSE 3 END, src_row {dir_sql}, id {dir_sql}")
+    order_sql = _order_sql(sort, dir_sql, group)
     with tx() as conn:
         total = conn.execute(f"SELECT COUNT(*) n FROM projects {sql_where}", args).fetchone()["n"]
         rows = conn.execute(
@@ -474,6 +497,14 @@ def upsert_project(payload: dict) -> int:
         "note": str(payload.get("note") or ""),
     }
     with tx() as conn:
+        # 手工新增且没带源表行号：排到该类型末尾（src_row=0 会冲到列表最前面，
+        # 让人误以为「没入库」或「排序乱了」）
+        if not fields["src_row"]:
+            mx = conn.execute(
+                "SELECT COALESCE(MAX(src_row), 0) AS m FROM projects WHERE ptype=?",
+                (ptype,),
+            ).fetchone()["m"]
+            fields["src_row"] = int(mx) + 1
         seq = _default_seq(conn, ptype, code, disc, payload)
         row = conn.execute(
             "SELECT id FROM projects WHERE ptype=? AND code=? AND disc=? AND seq=?",
@@ -497,23 +528,51 @@ def upsert_project(payload: dict) -> int:
 
 
 def update_project(pid: int, payload: dict) -> None:
+    """更新项目。
+
+    **允许修改「归属类型」(ptype) 与「编号」(code)**：项目从库存转加急这类
+    场景不需要删掉重建。换组时自动重算 seq，避开唯一键 (ptype,code,disc,seq)
+    冲突；月末填报里引用了该编号的记录也一并跟着换类型/编号（冲突则跳过）。
+    """
     allowed = ["name", "cell", "mol", "path", "animal", "extra", "price",
                "audit_sun", "audit_xu", "send_date", "note"]
-    sets, args = [], []
-    for k in allowed:
-        if k in payload:
-            sets.append(f"{k}=?")
-            args.append(payload[k])
-    if not sets:
-        return
     with tx() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not row:
+            return
+        fields = {k: payload[k] for k in allowed if k in payload}
+
+        new_ptype = str(payload.get("ptype") or row["ptype"]).strip() or row["ptype"]
+        new_code = str(payload.get("code") or row["code"]).strip() or row["code"]
+        # extra 就是 disc（分组标识），改了它等于换了分组
+        new_disc = str(fields.get("extra", row["disc"]) or "").strip()
+
+        seq = row["seq"]
+        if (new_ptype, new_code, new_disc) != (row["ptype"], row["code"], row["disc"]):
+            mx = conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) AS m FROM projects "
+                "WHERE ptype=? AND code=? AND disc=?",
+                (new_ptype, new_code, new_disc),
+            ).fetchone()["m"]
+            seq = int(mx) + 1
+
+        sets = ", ".join(f"{k}=?" for k in fields)
+        args = list(fields.values())
+        sets = (sets + ", " if sets else "") + "ptype=?, code=?, disc=?, seq=?"
+        args += [new_ptype, new_code, new_disc, seq]
         conn.execute(
-            f"UPDATE projects SET {','.join(sets)}, updated_at=? WHERE id=?",
+            f"UPDATE projects SET {sets}, updated_at=? WHERE id=?",
             args + [_now(), pid],
         )
-        if "extra" in payload:
-            conn.execute("UPDATE projects SET disc=? WHERE id=?",
-                         (str(payload.get("extra") or "").strip(), pid))
+
+        # 月末填报按 (月, 平台, 类型, 编号) 关联；类型/编号变了要跟着走，
+        # 否则历史填报会变成「查不到对应项目」的孤儿记录。
+        if (new_ptype, new_code) != (row["ptype"], row["code"]):
+            conn.execute(
+                "UPDATE OR IGNORE month_entries SET ptype=?, code=? "
+                "WHERE ptype=? AND code=?",
+                (new_ptype, new_code, row["ptype"], row["code"]),
+            )
 
 
 def delete_projects(ids: list) -> int:

@@ -341,9 +341,17 @@ VIEWS.browse = async (root) => {
           <option value="❌">仅标记未完成</option>
           <option value="/">仅未设计</option>
         </select>
-        <select class="select" id="ordSel" style="width:150px" title="排序方式">
-          <option value="asc"${(B.order || "asc") === "asc" ? " selected" : ""}>编号：正序（旧→新）</option>
-          <option value="desc"${B.order === "desc" ? " selected" : ""}>编号：倒序（新→旧）</option>
+        <select class="select" id="grpSel" style="width:132px" title="是否先按类型分组再排序">
+          <option value="type"${(B.group || "type") === "type" ? " selected" : ""}>按类型分组</option>
+          <option value="all"${B.group === "all" ? " selected" : ""}>全部混排</option>
+        </select>
+        <select class="select" id="sortSel" style="width:132px" title="排序依据">
+          <option value="code"${(B.sort || "code") === "code" ? " selected" : ""}>按编号排</option>
+          <option value="src"${B.sort === "src" ? " selected" : ""}>按录入顺序</option>
+        </select>
+        <select class="select" id="ordSel" style="width:104px" title="排序方向">
+          <option value="asc"${(B.order || "asc") === "asc" ? " selected" : ""}>正序</option>
+          <option value="desc"${B.order === "desc" ? " selected" : ""}>倒序</option>
         </select>
         <span class="spacer"></span>
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
@@ -361,9 +369,14 @@ VIEWS.browse = async (root) => {
     B.platform = $("#platSel").value;
     B.status = $("#stSel").value;
     B.order = $("#ordSel").value;
+    B.sort = $("#sortSel").value;
+    B.group = $("#grpSel").value;
+    // 只看单个类型时「分组」没意义（就一组），禁用避免误解
+    $("#grpSel").disabled = !!B.ptype;
     const q = new URLSearchParams({
       ptype: B.ptype, search: B.search, page: B.page, page_size: B.page_size,
       platform: B.platform, status: B.status, order: B.order || "asc",
+      sort: B.sort || "code", group: B.group || "type",
     });
     try {
       const r = await api("/api/projects?" + q.toString());
@@ -466,6 +479,8 @@ VIEWS.browse = async (root) => {
   $("#typeSel").addEventListener("change", (e) => { B.ptype = e.target.value; B.page = 1; load(); });
   $("#platSel").addEventListener("change", () => { B.page = 1; load(); });
   $("#stSel").addEventListener("change", () => { B.page = 1; load(); });
+  $("#grpSel").addEventListener("change", () => { savePref("browse_group", $("#grpSel").value); B.page = 1; load(); });
+  $("#sortSel").addEventListener("change", () => { savePref("browse_sort", $("#sortSel").value); B.page = 1; load(); });
   $("#ordSel").addEventListener("change", () => { savePref("browse_order", $("#ordSel").value); B.page = 1; load(); });
   $("#btnColReset").addEventListener("click", () => {
     Object.keys(COL_DEF).forEach((k) => { C.w[k] = COL_DEF[k]; delete C.man[k]; });
@@ -515,13 +530,14 @@ function editProject(id, reload) {
       title: isNew ? "新增项目" : "编辑项目",
       wide: true,
       body: `
+        ${isNew ? "" : `<div class="hint" style="margin:0 0 12px">改「项目类型」就能把项目换个分类（如库存 → 加急），不必删除后重建。</div>`}
         <div class="grid2">
           <div class="field"><label>项目类型</label>
-            <select class="select" id="f_ptype"${isNew ? "" : " disabled"}>
+            <select class="select" id="f_ptype">
               ${state.types.map((t) => `<option value="${t.key}"${data.ptype === t.key ? " selected" : ""}>${esc(t.label)}</option>`).join("")}
             </select></div>
           <div class="field"><label>项目编号</label>
-            <input class="input" id="f_code" value="${esc(data.code)}"${isNew ? "" : " readonly"}></div>
+            <input class="input" id="f_code" value="${esc(data.code)}"></div>
         </div>
         <div class="field" style="margin-top:14px"><label>项目名</label>
           <input class="input" id="f_name" value="${esc(data.name)}"></div>
@@ -577,8 +593,23 @@ function editProject(id, reload) {
           };
           if (!payload.code) return toast("项目编号不能为空", "warn");
           try {
-            if (isNew) await api("/api/projects", { method: "POST", body: payload });
-            else await api("/api/projects/" + id, { method: "PUT", body: payload });
+            if (isNew) {
+              // 同类型下已有同编号时先确认：同一编号允许多条（多次返修），
+              // 但直接再新增多半是「想改归属」而不是真想再记一条。
+              const chk = await api(`/api/projects?ptype=${encodeURIComponent(payload.ptype)}`
+                + `&search=${encodeURIComponent(payload.code)}&page_size=200`);
+              const same = (chk.data.rows || []).filter((r) => r.code === payload.code);
+              if (same.length) {
+                const zh = { real: "真实", urgent: "加急", stock: "库存", repair: "返修" }[payload.ptype] || payload.ptype;
+                const ok2 = confirm(`「${payload.code}」在「${zh}」下已经有 ${same.length} 条记录。\n\n`
+                  + `· 若只是想改归属/内容：取消，然后编辑原记录（列表右侧的铅笔按钮）。\n`
+                  + `· 若确实要再记一条（如再次返修）：确定，会追加为新的第 ${same.length + 1} 条。`);
+                if (!ok2) return;
+              }
+              await api("/api/projects", { method: "POST", body: payload });
+            } else {
+              await api("/api/projects/" + id, { method: "PUT", body: payload });
+            }
             closeModal(); toast("已保存"); reload();
           } catch (e) { toast(e.message, "error"); }
         });

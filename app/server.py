@@ -186,6 +186,8 @@ def api_list_projects(query, _b):
         page=int(query.get("page", [1])[0] or 1),
         page_size=int(query.get("page_size", [50])[0] or 50),
         order=query.get("order", ["asc"])[0] or "asc",
+        sort=query.get("sort", ["code"])[0] or "code",
+        group=query.get("group", ["type"])[0] or "type",
     ))
 
 
@@ -196,7 +198,13 @@ def api_get_project(_q, _b, pid):
     return ok(row)
 
 
+_VALID_TYPES = {k for k, _ in db.TYPES}
+
+
 def api_create_project(_q, body):
+    ptype = str(body.get("ptype") or "").strip()
+    if ptype not in _VALID_TYPES:
+        return fail("项目类型不合法", 400)
     try:
         return ok({"id": db.upsert_project(body)})
     except Exception as exc:  # noqa: BLE001
@@ -204,6 +212,12 @@ def api_create_project(_q, body):
 
 
 def api_update_project(_q, body, pid):
+    # 归属类型可以改（项目从库存转加急等），但要挡住非法值
+    ptype = str(body.get("ptype") or "").strip()
+    if ptype and ptype not in _VALID_TYPES:
+        return fail("项目类型不合法", 400)
+    if not db.get_project(pid):
+        return fail("项目不存在", 404)
     db.update_project(pid, body)
     return ok(True)
 
