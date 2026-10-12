@@ -167,7 +167,7 @@ VIEWS.dashboard = async (root) => {
           <span>💡</span>
           <div>月末到了？去 <b>「月末项目统计」</b>：管理员先新建当月统计，各平台实验员登录后填写本平台完成的编号，
             最后由管理员一键导出标准统计表。
-            ${admin ? "<br>要换数据？去 <b>「导入项目库」</b> 上传新的信息表；想回到初始状态，去 <b>「设置 → 数据维护 → 恢复出厂数据」</b>。"
+            ${admin ? "<br>要换数据？去 <b>「导入项目库」</b> 上传新的信息表；想推倒重来，去 <b>「设置 → 数据维护 → 清空项目库」</b>。"
                     : "<br>日常填报可直接在 <b>「项目库」</b> 列表里点自己平台那一列的状态。"}</div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -1310,10 +1310,10 @@ VIEWS.settings = async (root) => {
           <div style="display:flex;gap:10px;flex-wrap:wrap">
             <button class="btn btn-ghost" id="btnOpenData">查看数据目录</button>
             <button class="btn btn-ghost" id="btnBackup">备份数据库</button>
-            <button class="btn btn-danger" id="btnResetSeed">恢复出厂数据</button>
+            <button class="btn btn-danger" id="btnClearLib">清空项目库</button>
           </div>
           <div class="hint" style="margin-top:10px">数据全部保存在服务器容器内的数据卷中，重启不丢失。</div>
-          <div class="hint" style="margin-top:6px">「恢复出厂数据」会清空当前项目库并重新灌入内置的初始数据（<b>不影响</b>用户账号、系统设置与月末统计填报）。</div>
+          <div class="hint" style="margin-top:6px">「清空项目库」会删除当前全部项目（<b>不影响</b>用户账号、系统设置与月末统计填报）；程序不内置任何项目数据，请用「导入项目库」自己导入。</div>
         </div>
       </div>
     </div>`;
@@ -1336,12 +1336,12 @@ VIEWS.settings = async (root) => {
       toast("数据库已备份到服务器数据目录", "info", 4000); }
     catch (e) { toast(e.message, "error"); }
   });
-  $("#btnResetSeed").addEventListener("click", async () => {
-    if (!confirm("「恢复出厂数据」会清空当前项目库的全部项目，\n再重新导入内置的初始数据。\n\n用户账号、系统设置、月末项目统计填报不受影响，\n但项目库里的手工改动会丢失。确定继续？")) return;
+  $("#btnClearLib").addEventListener("click", async () => {
+    if (!confirm("「清空项目库」会删除当前项目库里的全部项目，且不可恢复。\n\n用户账号、系统设置、月末项目统计填报不受影响。\n建议先「备份数据库」。确定继续？")) return;
     try {
-      const r = await api("/api/system/reset-to-seed", { method: "POST", body: {} });
+      const r = await api("/api/projects/clear", { method: "POST", body: { ptype: "" } });
       const d = r.data || {};
-      toast(`已恢复出厂数据：共 ${(d.created || 0) + (d.updated || 0)} 条`, "info", 4000);
+      toast(`已清空项目库：删除 ${d.deleted || 0} 条`, "info", 4000);
       state.dash = null;
       go("settings");
     } catch (e) { toast(e.message, "error"); }
@@ -1354,8 +1354,7 @@ VIEWS.settings = async (root) => {
       <div class="kv"><span class="k">数据目录</span><span style="font-size:12px;font-family:Consolas,monospace">${esc(d.data_dir)}</span></div>
       <div class="kv"><span class="k">数据库大小</span><b>${(d.db_size / 1024).toFixed(1)} KB</b></div>
       <div class="kv"><span class="k">项目记录数</span><b>${d.total}</b></div>
-      <div class="kv"><span class="k">上次导入</span><span>${esc(d.last_import || "—")}</span></div>
-      <div class="kv"><span class="k">出厂数据</span><span>${d.seed_available ? ("已内置 seed v" + esc(d.seed_version || "?")) : '<span style="color:var(--red)">未内置</span>'}</span></div>`;
+      <div class="kv"><span class="k">上次导入</span><span>${esc(d.last_import || "—")}</span></div>`;
   } catch (e) {
     $("#sysInfo").innerHTML = `<div class="empty"><p>${esc(e.message)}</p></div>`;
   }

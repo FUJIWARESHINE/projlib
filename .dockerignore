@@ -16,4 +16,4 @@ build.py
 app/main.py
 app/icon.ico
 
-# 注意：不要排除 app/seed/（内置出厂数据必须进镜像）
+# 注意：镜像不内置项目库数据（原 app/seed/ 已移除），新实例项目库为空

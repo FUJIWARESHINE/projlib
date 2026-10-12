@@ -21,7 +21,6 @@ import auth
 import db
 import export_excel
 import importer
-import seed
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -700,20 +699,7 @@ def api_download(query, _b):
 
 def api_system_info(_q, _b):
     info = db.data_info()
-    info["seed_available"] = seed.has_seed()
-    info["seed_version"] = db.get_meta(seed.SEED_META_KEY, "")
     return ok(info)
-
-
-def api_reset_to_seed(_q, _b):
-    """清空项目库并恢复成内置出厂数据（仅动项目库，不影响账号/设置/月末统计）。"""
-    try:
-        result = seed.reset_to_seed()
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"恢复出厂数据失败：{exc}")
-    if not result.get("ok"):
-        return fail(result.get("error") or "恢复出厂数据失败")
-    return ok(result)
 
 
 def api_backup(_q, _b):
@@ -799,7 +785,6 @@ ROUTES = [
     ("GET", re.compile(r"^/api/system/info$"), api_system_info),
     ("POST", re.compile(r"^/api/system/backup$"), api_backup),
     ("POST", re.compile(r"^/api/system/package$"), api_package),
-    ("POST", re.compile(r"^/api/system/reset-to-seed$"), api_reset_to_seed),
     ("GET", re.compile(r"^/api/health$"), api_health),
 ]
 
@@ -877,7 +862,6 @@ ADMIN_KEY_SET = {
     ("/api/system/pick-file", "POST"),
     ("/api/export/all", "GET"), ("/api/export/multi", "POST"),
     ("/api/system/backup", "POST"), ("/api/system/package", "POST"),
-    ("/api/system/reset-to-seed", "POST"),
     ("/api/months", "POST"),            # 创建月份仅管理员
     ("/api/months/*", "DELETE"),
     ("/api/months/*/lock", "POST"),
@@ -1020,23 +1004,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, content, MIME.get(ext, "application/octet-stream"))
 
 
-def _seed_on_boot() -> None:
-    """首次启动若项目库为空，自动导入内置出厂数据（失败不阻断启动）。"""
-    try:
-        r = seed.ensure_seeded()
-        if r.get("seeded"):
-            print(f"PROJLIB_SEEDED 已灌入内置出厂数据：新建 {r.get('created', 0)} 条"
-                  f" / 更新 {r.get('updated', 0)} 条（seed v{r.get('seed_version')}）", flush=True)
-        elif r.get("reason") == "no_seed_file":
-            print("PROJLIB_SEED_SKIP 未找到内置数据文件，跳过自动导入", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"PROJLIB_SEED_ERROR 内置数据导入失败（已跳过）：{exc}", flush=True)
-
-
 def start_server(port: int | None = None, host: str = "127.0.0.1") -> tuple[ThreadingHTTPServer, int]:
     db.init_db()
     auth.ensure_builtin_admin()      # 首次启动创建内置管理员（见 auth.BUILTIN_ADMIN_*）
-    _seed_on_boot()                  # 首次启动（库为空）自动灌入内置出厂数据
+    # 注意：镜像不再内置任何项目库数据，新实例项目库为空，由管理员自行导入。
     port = port or find_free_port()
     httpd = ThreadingHTTPServer((host, port), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)

@@ -21,8 +21,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY app/ /app/app/
 COPY web/ /app/web/
 
-# 内置出厂数据（首次启动自动导入，见 app/seed.py）
-COPY app/seed/ /app/app/seed/
+# 说明：镜像不内置任何项目库数据，新实例的项目库为空，由管理员在「导入项目库」自行导入。
 
 # 数据卷（数据库、导出文件都在这里）
 RUN mkdir -p /data
