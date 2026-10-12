@@ -50,3 +50,41 @@
 
 程序自带内置项目库数据（加急 / 返修 / 库存，共 218 条），首次启动自动灌入，开箱即用。
 管理员可在「设置 → 数据维护 → 恢复出厂数据」把项目库重置回内置的初始数据。
+
+## 部署（Docker）
+
+### 方式一：直接用已发布镜像（推荐，不需要源码和构建）
+
+```bash
+docker compose up -d          # 拉取 xuthsand/projlib:latest 并启动
+```
+
+启动后访问 `http://<主机IP>:8775`，数据落在 compose 文件同级的 `./data`。
+首次启动会自动创建内置管理员账号、灌入内置出厂数据。
+
+想改端口 / 数据目录，不必改 compose 文件，同目录放一个 `.env` 即可：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `PROJLIB_PORT` | `8775` | 宿主机端口（右边容器端口 8775 不要改） |
+| `PROJLIB_DATA` | `./data` | 宿主机数据目录（数据库 / 导出文件 / 导入副本） |
+| `PROJLIB_TAG` | `latest` | 镜像标签（`latest` / `edge` / `v1.0.0`） |
+| `PROJLIB_IMAGE` | `xuthsand/projlib` | 镜像地址 |
+| `TZ` | `Asia/Shanghai` | 时区 |
+
+镜像同步发布在 `ghcr.io/fujiwareshine/projlib`，内网拉不到 Docker Hub 时把
+`PROJLIB_IMAGE` 换成它即可，其余不用动。
+
+### 方式二：从源码本地构建（内网无外网 / 改了代码要生效）
+
+```bash
+docker compose -f docker-compose.build.yml up -d --build
+```
+
+> 两种方式用同一个 compose 项目名 `projlib`，是二选一关系，不要同时起。
+
+### 更新版本
+
+```bash
+docker compose pull && docker compose up -d
+```

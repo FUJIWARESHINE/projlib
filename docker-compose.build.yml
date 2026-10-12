@@ -1,0 +1,40 @@
+# ============================================================================
+#  项目库统计程序 · Docker Compose（从源码构建版）
+# ----------------------------------------------------------------------------
+#  给「内网拉不到 Docker Hub 镜像」或「改了代码要本地生效」的场景用。
+#  请在本文件所在目录（即源码根目录）执行：
+#
+#      docker compose -f docker-compose.build.yml up -d --build
+#
+#  与 docker-compose.yml 用同一个项目名 projlib，两者是「二选一」关系，
+#  不要同时起（会争同一个容器名和端口）。
+# ============================================================================
+
+name: projlib
+
+services:
+  projlib:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${PROJLIB_IMAGE:-xuthsand/projlib}:${PROJLIB_TAG:-local}
+    container_name: ${PROJLIB_NAME:-projlib}
+    restart: unless-stopped
+
+    ports:
+      - "${PROJLIB_PORT:-8775}:8775"
+
+    volumes:
+      - "${PROJLIB_DATA:-./data}:/data"
+
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PROJLIB_PORT: "8775"
+      PROJLIB_DATA_DIR: /data
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8775/api/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

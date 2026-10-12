@@ -1,16 +1,45 @@
+# ============================================================================
+#  项目库统计程序 · Docker Compose（通用版：直接用已发布镜像，不需要源码和构建）
+# ----------------------------------------------------------------------------
+#  启动：  docker compose up -d
+#  更新：  docker compose pull && docker compose up -d
+#  停止：  docker compose down          （数据保留在 ./data）
+#  访问：  http://<主机IP>:8775
+#
+#  想从源码本地构建（内网拉不到镜像时）：
+#         docker compose -f docker-compose.build.yml up -d --build
+#
+#  想改端口/数据目录，不必编辑本文件，在旁边的 .env 里覆盖即可：
+#         PROJLIB_PORT=9000
+#         PROJLIB_DATA=/vol1/docker/projlib/data
+# ============================================================================
+
+# 固定项目名：目录名是中文时 Compose 推导不出项目名会报错，写死最稳
+name: projlib
+
 services:
   projlib:
-    build: .
-    image: projlib:latest
-    container_name: projlib
+    # 已发布的镜像：Docker Hub 上的 xuthsand/projlib
+    image: ${PROJLIB_IMAGE:-xuthsand/projlib}:${PROJLIB_TAG:-latest}
+    container_name: ${PROJLIB_NAME:-projlib}
     restart: unless-stopped
+
     ports:
-      # 左边是宿主机端口（可改），右边是容器内端口（保持 8775）
-      - "5666:8775"
+      # 左边 = 宿主机端口（可改），右边 = 容器内端口（固定 8775，别改）
+      - "${PROJLIB_PORT:-8775}:8775"
+
     volumes:
-      # 数据（数据库 + 导出文件）持久化到宿主机
-      - ./data:/data
+      # 数据持久化：数据库 / 导出文件 / 导入源文件副本都在这里
+      - "${PROJLIB_DATA:-./data}:/data"
+
     environment:
-      - TZ=Asia/Shanghai
-      - PROJLIB_PORT=8775
-      - PROJLIB_DATA_DIR=/data
+      TZ: ${TZ:-Asia/Shanghai}
+      PROJLIB_PORT: "8775"
+      PROJLIB_DATA_DIR: /data
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8775/api/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
