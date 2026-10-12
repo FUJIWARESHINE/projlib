@@ -481,6 +481,7 @@ def export_month_stat(detail: dict) -> str:
     _setup_page(ws)
     last_col = get_column_letter(ncols)
 
+    n_total = len(order)             # 项目数（同一编号多平台填报只算一个）
     n_done = sum(1 for k in order if merged[k]["done"] == "已完成")
     n_undone = sum(1 for k in order if merged[k]["done"] == "未完成")
     n_miss = sum(1 for k in order if merged[k]["done"] == "库中未找到")
@@ -494,13 +495,19 @@ def export_month_stat(detail: dict) -> str:
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 40
 
-    sub = (f"共 {len(order)} 个项目 / {detail.get('total') or 0} 条填报"
-           f"    |    已完成 {n_done} · 未完成 {n_undone}")
+    # 副标题（第 2 行）——用户 2026-10-12 指定格式：
+    #   共 N 个项目    |    已完成 X · 未完成 Y    |    真实 a 项 · 加急 b 项 · 库存 c 项 · 返修 d 项
+    # 只统计项目数（不写填报条数）、只写已完成/未完成、分类维度用四大类型（不再按平台）
+    sub = f"共 {n_total} 个项目    |    已完成 {n_done} · 未完成 {n_undone}"
     if n_miss:
         sub += f" · 库中未找到 {n_miss}"
-    counts = " · ".join(f"{p.get('label')} {p.get('count') or 0} 项" for p in platforms)
-    if counts:
-        sub += f"    |    {counts}"
+    type_counts = [
+        f"{M_BLOCK_LABELS.get(ptype, ptype)} "
+        f"{sum(1 for k in order if k[0] == ptype)} 项"
+        for ptype, _plabel in db.TYPES
+    ]
+    if type_counts:
+        sub += "    |    " + " · ".join(type_counts)
     ws.merge_cells(f"A2:{last_col}2")
     s = ws["A2"]
     s.value = sub
