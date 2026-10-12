@@ -880,11 +880,14 @@ async function loadMonth() {
         <div class="mh-meta">
           <span class="mi-st ${month.status}">${esc(month.status_name)}</span>
           <span>共 <b>${d.total}</b> 项</span>
+          ${!locked && d.platforms.some((p) => p.can_edit)
+            ? `<span class="mh-hint">💡 编号按住可直接拖到其他类型 / 平台</span>` : ""}
           ${month.exported_at ? `<span>上次导出 ${esc(month.exported_at)}</span>` : ""}
         </div>
       </div>
       <div class="mh-actions">
         ${admin ? `
+          <button class="btn btn-ghost btn-sm" id="btnEditMonth">编辑月份</button>
           <button class="btn btn-ghost btn-sm" id="btnLockMonth">${locked ? "解锁填报" : "锁定填报"}</button>
           <button class="btn btn-ghost btn-sm" id="btnDelMonth">删除月份</button>
           <button class="btn btn-primary" id="btnExportMonth">
@@ -900,6 +903,7 @@ async function loadMonth() {
 
   if (admin) {
     $("#btnExportMonth").addEventListener("click", () => exportMonth(month));
+    $("#btnEditMonth").addEventListener("click", () => editMonthDialog(month));
     $("#btnLockMonth").addEventListener("click", async () => {
       try {
         await api(`/api/months/${month.id}/lock`, { method: "POST", body: { locked: !locked } });
@@ -920,6 +924,9 @@ async function loadMonth() {
   $$("[data-addplat]").forEach((btn) => {
     btn.addEventListener("click", () => addEntryDialog(btn.dataset.addplat));
   });
+  $$("[data-editcodes]").forEach((btn) => {
+    btn.addEventListener("click", () => editCodesDialog(btn.dataset.editcodes));
+  });
   $$("[data-delentry]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       try {
@@ -927,6 +934,12 @@ async function loadMonth() {
           { method: "DELETE" });
         toast("已移除"); loadMonth();
       } catch (e) { toast(e.message, "error"); }
+    });
+  });
+  $$("[data-editentry]").forEach((btn) => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      editEntryDialog(Number(btn.dataset.editentry));
     });
   });
 }
@@ -953,14 +966,18 @@ function platCard(p, d, locked) {
   const canEdit = p.can_edit && !locked;
   const TYPES = [["real", "真实"], ["urgent", "加急"], ["stock", "库存"], ["repair", "返修"]];
   return `
-    <div class="card plat-card">
+    <div class="card plat-card" data-platform="${p.key}" data-canedit="${canEdit ? 1 : 0}">
       <div class="plat-card-head" data-p="${p.key}">
         <div class="pc-title">
           <span class="pc-dot"></span>${esc(p.label)}
           <span class="pc-count">${p.count} 项</span>
         </div>
         ${canEdit
-          ? `<button class="btn btn-ghost btn-sm" data-addplat="${p.key}">+ 添加编号</button>`
+          ? `<span class="pc-acts">
+               <button class="btn btn-ghost btn-sm" data-editcodes="${p.key}"
+                       title="把本平台四类编号列出来一起改">编辑编号</button>
+               <button class="btn btn-ghost btn-sm" data-addplat="${p.key}">+ 添加编号</button>
+             </span>`
           : `<span class="pc-lock">${locked ? "已锁定" : (p.can_edit ? "" : "只读")}</span>`}
       </div>
       <div class="plat-card-body">
@@ -968,19 +985,26 @@ function platCard(p, d, locked) {
           ${TYPES.map(([k, l]) => {
             const items = p.items.filter((it) => it.ptype === k);
             return `
-            <div class="type-col t-${k}">
+            <div class="type-col t-${k}" data-ptype="${k}" data-platform="${p.key}">
               <div class="type-col-head">
                 <span class="pill ${TYPE_PILL[k]}">${l}</span>
                 <span class="type-col-count">${items.length || ""}</span>
               </div>
               <div class="type-col-list">
                 ${items.length ? items.map((it) => `
-                  <div class="entry-row">
+                  <div class="entry-row" data-eid="${it.id}" data-ptype="${it.ptype}"
+                       data-platform="${p.key}"${canEdit ? ' draggable="true"' : ""}
+                       title="${canEdit ? "可拖动改归类；右上「编辑编号」可整平台一起改" : ""}">
                     <div class="er-main">
                       <span class="er-code">${esc(it.code)}</span>
-                      ${canEdit ? `<button class="er-del" data-delentry="${it.id}" title="移除">
+                      ${canEdit ? `<span class="er-acts">
+                        <button class="er-edit" data-editentry="${it.id}" title="编辑编号 / 类型" draggable="false">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4z"/></svg>
+                        </button>
+                        <button class="er-del" data-delentry="${it.id}" title="移除" draggable="false">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
-                      </button>` : ""}
+                      </button>
+                      </span>` : ""}
                     </div>
                     <div class="er-name" title="${esc(it.name)}">
                       ${esc(it.name) || '<span class="er-unmatched">库中未找到</span>'}
@@ -997,32 +1021,146 @@ function platCard(p, d, locked) {
     </div>`;
 }
 
-function addEntryDialog(platform) {
+/* ---------------------------------------------------------------- 月末：拖动改归类
+   场景：实验员把编号填到了错误的类型（比如本该「加急」填进了「库存」）。
+   直接按住编号行拖到目标类型列即可改归类；拖到其他平台卡（有权限时）则改平台。
+   统一走 PUT /api/months/<mid>/entries/<eid>，服务端再校验权限与锁定状态。 */
+const ENTRY_DRAG = { eid: 0, platform: "", ptype: "" };
+let entryDropEl = null;
+
+function entryDropTarget(e) {
+  const t = e.target;
+  if (!t || !t.closest) return null;
+  const col = t.closest(".type-col[data-ptype]");
+  if (col && col.closest(".plat-card")?.dataset.canedit === "1") return col;
+  const card = t.closest(".plat-card[data-platform]");
+  if (card && card.dataset.canedit === "1") return card;
+  return null;
+}
+
+function setEntryDropHl(el) {
+  if (entryDropEl === el) return;
+  if (entryDropEl) entryDropEl.classList.remove("drop-hover");
+  entryDropEl = el;
+  if (el) el.classList.add("drop-hover");
+}
+
+document.addEventListener("dragstart", (e) => {
+  const row = e.target.closest && e.target.closest('.entry-row[data-eid][draggable="true"]');
+  if (!row) return;
+  ENTRY_DRAG.eid = Number(row.dataset.eid);
+  ENTRY_DRAG.platform = row.dataset.platform;
+  ENTRY_DRAG.ptype = row.dataset.ptype;
+  row.classList.add("dragging");
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(row.dataset.eid));
+  }
+});
+
+document.addEventListener("dragend", () => {
+  $$(".entry-row.dragging").forEach((r) => r.classList.remove("dragging"));
+  setEntryDropHl(null);
+  ENTRY_DRAG.eid = 0;
+});
+
+document.addEventListener("dragover", (e) => {
+  if (!ENTRY_DRAG.eid) return;
+  const tgt = entryDropTarget(e);
+  if (!tgt) { setEntryDropHl(null); return; }
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  setEntryDropHl(tgt);
+});
+
+document.addEventListener("dragleave", (e) => {
+  if (!ENTRY_DRAG.eid) return;
+  const to = e.relatedTarget;
+  if (!to || !to.closest || !to.closest("#monthMain")) setEntryDropHl(null);
+});
+
+document.addEventListener("drop", async (e) => {
+  if (!ENTRY_DRAG.eid) return;
+  const tgt = entryDropTarget(e);
+  setEntryDropHl(null);
+  if (!tgt) return;
+  e.preventDefault();
+  const eid = ENTRY_DRAG.eid;
+  const mid = state.month.mid;
+  ENTRY_DRAG.eid = 0;
+  if (!mid) return;
+  const isCol = tgt.classList.contains("type-col");
+  const platform = tgt.dataset.platform;
+  const ptype = isCol ? tgt.dataset.ptype : "";
+  if (platform === ENTRY_DRAG.platform && (!ptype || ptype === ENTRY_DRAG.ptype)) return;
+  try {
+    const r = await api(`/api/months/${mid}/entries/${eid}`, {
+      method: "PUT",
+      body: ptype ? { platform, ptype } : { platform },
+    });
+    const dd = r.data || {};
+    if (dd.unchanged) return;
+    toast(`已移动到「${dd.platform_label || platform} · ${dd.type_label || ""}」`);
+    loadMonth();
+  } catch (err) { toast(err.message, "error"); }
+});
+
+/* 添加 / 编辑某平台当月填报的编号 —— 同一个弹窗（四类并列），两种模式：
+     mode = "add"  空白起手，提交走 POST（只增不改，已存在的自动跳过）
+     mode = "edit" **四类现有编号全部回填**，提交走 PUT（整平台同步）：
+                   框里是什么就存成什么 —— 删掉的行 = 移除该编号、
+                   剪切到别的类型框 = 改归类、新加一行 = 新增。
+                   所以不用一条一条点铅笔。
+   ⚠️ edit 模式下清空某个类型框 = 移除该类型下所有编号，提交前会二次确认。 */
+function entryCodesDialog(platform, mode) {
   const M = state.month;
+  const editing = mode === "edit";
   const platLabel = PLATFORM_LABEL[platform] || platform;
   const TYPES = [["real", "真实"], ["urgent", "加急"], ["stock", "库存"], ["repair", "返修"]];
+
+  // 现有填报（edit 模式用于回填与变更比对；add 模式为空）
+  const plat = editing
+    ? ((state.month.detail?.platforms || []).find((x) => x.key === platform) || { items: [] })
+    : { items: [] };
+  const items = plat.items || [];
+  const codesOf = (k) => items.filter((it) => it.ptype === k).map((it) => it.code);
+  const snapshot = (list) => list
+    .map((g) => `${g.ptype}|${[...g.codes].map((c) => String(c).toUpperCase()).sort().join(",")}`)
+    .sort().join(";");
+  const beforeSig = snapshot(TYPES.map(([k]) => ({ ptype: k, codes: codesOf(k) })));
+
   openModal({
-    title: `添加 ${platLabel} 平台完成的编号`,
+    title: editing
+      ? `编辑 ${platLabel} 平台的填报编号`
+      : `添加 ${platLabel} 平台完成的编号`,
     wide: true,
     body: `
-      <div class="notice info" style="margin-bottom:14px"><span>💡</span>
-        <div>向 <b>${esc(platLabel)}</b> 平台一次性添加当月完成的编号：<b>四类可同时填写</b>，
-          哪个类型下有编号就填在对应框里（用不到的留空即可）。每行一个编号，也可用逗号 / 空格分隔。<br>
-          编号不区分大小写（填 <code>a384</code> 也能匹配到 <code>A384</code>）。</div></div>
+      <div class="notice info" style="margin-bottom:14px"><span>${editing ? "✏️" : "💡"}</span>
+        <div>${editing
+          ? `本平台当月四类编号已<b>全部列出</b>，直接在框里改，改完点保存一次到位：
+             删掉某行 = 移除该编号；把它剪切到别的类型框 = 改归类；新加一行 = 新增；
+             某个类型框清空即表示该类型下没有编号。`
+          : `向 <b>${esc(platLabel)}</b> 平台一次性添加当月完成的编号：<b>四类可同时填写</b>，
+             哪个类型下有编号就填在对应框里（用不到的留空即可）。`}
+          <br>每行一个编号，也可用逗号 / 空格分隔；编号不区分大小写（填 <code>a384</code> 也能匹配到 <code>A384</code>）。</div></div>
       <div class="type-grid">
-        ${TYPES.map(([k, l]) => `
+        ${TYPES.map(([k, l]) => {
+          const cur = codesOf(k);
+          const rows = Math.min(Math.max(cur.length + 1, 4), 12);
+          return `
           <div class="type-col t-${k}">
             <div class="type-col-head">
               <span class="pill ${TYPE_PILL[k]}">${l}</span>
-              <span class="type-col-count" data-count="${k}"></span>
+              <span class="type-col-count" data-count="${k}" data-orig="${cur.length}">${editing && cur.length ? `${cur.length} 个` : ""}</span>
             </div>
-            <textarea class="textarea code-area type-input" data-ptype="${k}" rows="4"
-              placeholder="${l}编号"></textarea>
-          </div>`).join("")}
+            <textarea class="textarea code-area type-input" data-ptype="${k}" rows="${rows}"
+              placeholder="${l}编号">${editing ? esc(cur.join("\n")) : ""}</textarea>
+          </div>`;
+        }).join("")}
       </div>`,
     footer: `<span style="flex:1"></span>
       <button class="btn btn-ghost" data-close>取消</button>
-      <button class="btn btn-primary" data-add>添加到 ${esc(platLabel)} 平台</button>`,
+      <button class="btn btn-primary" data-add>${editing ? "保存修改" : `添加到 ${esc(platLabel)} 平台`}</button>`,
     onMount(root) {
       const tas = $$(".type-input", root);
       const refresh = () => {
@@ -1031,12 +1169,22 @@ function addEntryDialog(platform) {
           const n = splitCodes(t.value).length;
           total += n;
           const badge = $(`[data-count="${t.dataset.ptype}"]`, root);
-          if (badge) badge.textContent = n ? `${n} 个` : "";
+          if (badge) {
+            // 编辑模式下跟「原来的条数」对比一下，改了哪些类型一眼能看出来
+            const orig = Number(badge.dataset.orig || 0);
+            badge.textContent = n ? `${n} 个` : "";
+            if (editing && n !== orig) badge.textContent = `${n} 个（原 ${orig}）`;
+          }
         });
         const btn = $("[data-add]", root);
-        if (btn) btn.textContent = total
-          ? `添加到 ${platLabel} 平台（共 ${total} 个）`
-          : `添加到 ${platLabel} 平台`;
+        if (!btn) return;
+        if (editing) {
+          btn.textContent = total ? `保存修改（共 ${total} 个）` : "保存修改（将清空本平台）";
+        } else {
+          btn.textContent = total
+            ? `添加到 ${platLabel} 平台（共 ${total} 个）`
+            : `添加到 ${platLabel} 平台`;
+        }
       };
       tas.forEach((ta) => {
         // 编号输入自动转大写（项目库编号均为大写；后端也会再兜底一次）
@@ -1051,20 +1199,132 @@ function addEntryDialog(platform) {
       refresh();
 
       $("[data-add]", root).addEventListener("click", async () => {
-        const groups = tas
-          .map((t) => ({ ptype: t.dataset.ptype, codes: splitCodes(t.value) }))
-          .filter((g) => g.codes.length);
-        if (!groups.length) return toast("请至少在一个类型下填写编号", "warn");
+        const cur = TYPES.map(([k]) => ({
+          ptype: k,
+          codes: splitCodes($(`[data-ptype="${k}"]`, root).value),
+        }));
+        const groups = cur.filter((g) => g.codes.length);
+        if (!editing && !groups.length) return toast("请至少在一个类型下填写编号", "warn");
+
+        if (editing) {
+          if (snapshot(cur) === beforeSig) { closeModal(); return toast("编号没有变化"); }
+          const after = new Set();
+          const dup = [];
+          cur.forEach((g) => g.codes.forEach((c) => {
+            if (after.has(c)) dup.push(c);
+            after.add(c);
+          }));
+          const removed = items.filter((it) => !after.has(String(it.code).toUpperCase()));
+          const msgs = [];
+          if (removed.length) {
+            msgs.push(`将移除 ${removed.length} 个编号：` +
+              removed.slice(0, 10).map((x) => x.code).join("、") + (removed.length > 10 ? " …" : ""));
+          }
+          if (dup.length) {
+            msgs.push(`${[...new Set(dup)].join("、")} 同时出现在多个类型下，会各记一条`);
+          }
+          if (msgs.length && !confirm(msgs.join("\n") + "\n\n确定保存？")) return;
+        }
+
         const btn = $("[data-add]", root);
         btn.disabled = true;
         try {
-          const r = await api(`/api/months/${M.mid}/entries`, {
-            method: "POST",
-            body: { platform, groups },
+          if (editing) {
+            const r = await api(`/api/months/${M.mid}/entries`, {
+              method: "PUT",
+              body: { platform, groups: cur },
+            });
+            const dd = r.data || {};
+            const parts = [];
+            if (dd.added) parts.push(`新增 ${dd.added}`);
+            if (dd.moved) parts.push(`改归类 ${dd.moved}`);
+            if (dd.removed) parts.push(`移除 ${dd.removed}`);
+            closeModal();
+            toast(parts.length ? `已保存：${parts.join("、")}` : "编号没有变化");
+          } else {
+            const r = await api(`/api/months/${M.mid}/entries`, {
+              method: "POST",
+              body: { platform, groups },
+            });
+            const { added, skipped } = r.data;
+            closeModal();
+            toast(`已添加 ${added} 个编号` + (skipped && skipped.length ? `，${skipped.length} 个已存在` : ""));
+          }
+          loadMonth();
+        } catch (e) { btn.disabled = false; toast(e.message, "error"); }
+      });
+    },
+  });
+}
+
+function addEntryDialog(platform) { entryCodesDialog(platform, "add"); }
+function editCodesDialog(platform) { entryCodesDialog(platform, "edit"); }
+
+
+/* 编辑一条已填报的编号（编号 / 类型 / 平台都能改），不用删了重加。
+   权限与拖动一致：只列得出自己有编辑权限的平台（管理员 = 全部）。 */
+function editEntryDialog(entryId) {
+  const d = state.month.detail;
+  if (!d) return;
+  let it = null, platKey = "";
+  d.platforms.forEach((p) => p.items.forEach((x) => {
+    if (x.id === entryId) { it = x; platKey = p.key; }
+  }));
+  if (!it) return toast("这条记录已不存在，刷新后再试", "warn");
+  const canPlats = d.platforms.filter((p) => p.can_edit);
+  if (!canPlats.length) return toast("你没有该平台板块的编辑权限", "error");
+
+  const TYPES = [["real", "真实"], ["urgent", "加急"], ["stock", "库存"], ["repair", "返修"]];
+  const platOpts = canPlats.map((p) =>
+    `<option value="${p.key}"${p.key === platKey ? " selected" : ""}>${esc(p.label)}</option>`).join("");
+
+  openModal({
+    title: "编辑填报编号",
+    body: `
+      <div class="notice info" style="margin-bottom:14px"><span>✏️</span>
+        <div>编号填错了直接改就行，<b>不用删掉重加</b>；类型 / 平台也可以在这里换
+          （页面上把编号拖到别的列效果一样）。改完项目名与报价会重新匹配。</div></div>
+      <div class="field"><label>项目编号</label>
+        <input class="input" id="eeCode" value="${esc(it.code)}" placeholder="如 A384" autocomplete="off"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div class="field"><label>项目类型</label>
+          <select class="select" id="eeType">
+            ${TYPES.map(([k, l]) => `<option value="${k}"${k === it.ptype ? " selected" : ""}>${l}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>所属平台</label>
+          <select class="select" id="eePlat"${canPlats.length === 1 ? " disabled" : ""}>${platOpts}</select></div>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--text3)">
+        当前项目名：${esc(it.name) || '<span class="er-unmatched">库中未找到</span>'}
+      </div>`,
+    footer: `<span style="flex:1"></span>
+      <button class="btn btn-ghost" data-close>取消</button>
+      <button class="btn btn-primary" data-save>保存</button>`,
+    onMount(root) {
+      const codeEl = $("#eeCode", root);
+      codeEl.addEventListener("input", () => {   // 编号统一大写（后端也会兜底）
+        const p = codeEl.selectionStart;
+        codeEl.value = codeEl.value.toUpperCase();
+        codeEl.setSelectionRange(p, p);
+      });
+      codeEl.focus();
+      codeEl.select();
+
+      $("[data-save]", root).addEventListener("click", async () => {
+        const code = codeEl.value.trim();
+        if (!code) return toast("请输入项目编号", "warn");
+        const ptype = $("#eeType", root).value;
+        const platform = $("#eePlat", root).value;
+        const btn = $("[data-save]", root);
+        btn.disabled = true;
+        try {
+          const r = await api(`/api/months/${state.month.mid}/entries/${entryId}`, {
+            method: "PUT", body: { code, ptype, platform },
           });
-          const { added, skipped } = r.data;
           closeModal();
-          toast(`已添加 ${added} 个编号` + (skipped && skipped.length ? `，${skipped.length} 个已存在` : ""));
+          const dd = r.data || {};
+          if (dd.unchanged) return;
+          toast(`已更新：${(dd.entry || {}).code} · ${dd.type_label || ""}`);
           loadMonth();
         } catch (e) { btn.disabled = false; toast(e.message, "error"); }
       });
@@ -1113,6 +1373,73 @@ function newMonthDialog() {
           state.month.mid = r.data.month.id;
           go("month");
         } catch (e) { toast(e.message, "error"); }
+      });
+    },
+  });
+}
+
+/* 月份名称 / 年月改完后：左侧列表与右侧详情一起刷新（年月的改动会影响列表排序） */
+async function refreshMonthAll() {
+  try {
+    const r = await api("/api/months");
+    state.month.list = r.data.months || [];
+  } catch (e) { /* 列表拉取失败也继续刷新详情 */ }
+  renderMonthList();
+  await loadMonth();
+}
+
+/* 编辑统计月份：建错月份（9 月建成 10 月）时直接改回来，已填报的编号全部保留 */
+function editMonthDialog(month) {
+  const now = new Date();
+  const y = month.year || now.getFullYear();
+  const mo = month.month || (now.getMonth() + 1);
+  openModal({
+    title: "编辑统计月份",
+    body: `
+      <div class="notice info" style="margin-bottom:14px"><span>✏️</span>
+        <div>改的是这个月份的<b>名称与年月</b>；各平台<b>已填写的编号一条都不会丢</b>，
+          不用删掉整个统计重建。</div></div>
+      <div class="field"><label>月份名称</label>
+        <input class="input" id="emName" value="${esc(month.name)}" placeholder="如 2026年9月"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div class="field"><label>年份</label>
+          <input class="input" id="emYear" type="number" value="${y}"></div>
+        <div class="field"><label>月份</label>
+          <input class="input" id="emMonth" type="number" min="1" max="12" value="${mo}"></div>
+      </div>`,
+    footer: `<span style="flex:1"></span>
+      <button class="btn btn-ghost" data-close>取消</button>
+      <button class="btn btn-primary" data-save>保存</button>`,
+    onMount(root) {
+      const nameEl = $("#emName", root), yEl = $("#emYear", root), mEl = $("#emMonth", root);
+      // 名称是标准写法「YYYY年M月」时，改年月就跟着同步（自定义名称不动）
+      const AUTO = /^\s*\d{4}\s*年\s*\d{1,2}\s*月\s*$/;
+      const syncName = () => {
+        if (!AUTO.test(nameEl.value)) return;
+        const yy = yEl.value.trim(), mm = mEl.value.trim();
+        if (yy && mm) nameEl.value = `${yy}年${Number(mm)}月`;
+      };
+      yEl.addEventListener("input", syncName);
+      mEl.addEventListener("input", syncName);
+      nameEl.focus();
+
+      $("[data-save]", root).addEventListener("click", async () => {
+        const name = nameEl.value.trim();
+        if (!name) return toast("请输入月份名称", "warn");
+        const yy = Number(yEl.value) || 0;
+        const mm = Number(mEl.value) || 0;
+        if (yy && (yy < 1900 || yy > 2200)) return toast("年份需在 1900-2200 之间", "warn");
+        if (mm && (mm < 1 || mm > 12)) return toast("月份需在 1-12 之间", "warn");
+        const btn = $("[data-save]", root);
+        btn.disabled = true;
+        try {
+          const r = await api("/api/months/" + month.id, {
+            method: "PUT", body: { name, year: yy, month: mm },
+          });
+          closeModal();
+          toast("已更新为：" + r.data.month.name);
+          await refreshMonthAll();
+        } catch (e) { btn.disabled = false; toast(e.message, "error"); }
       });
     },
   });

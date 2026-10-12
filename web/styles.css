@@ -833,6 +833,8 @@ body.col-resizing .col-rs::after { background: var(--primary); top: 0; bottom: 0
 .plat-empty { margin: auto; padding: 0 12px; }
 .pc-count { font-size: 12px; font-weight: 400; color: var(--text3); }
 .pc-lock { font-size: 11.5px; color: var(--text3); }
+/* 平台卡右上角操作（编辑编号 / 添加编号）：窄屏时换行，别把标题挤没 */
+.pc-acts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 
 /* ---- 四列类型网格（卡片内 & 填报弹窗共用）---- */
 .type-grid {
@@ -878,11 +880,30 @@ body.col-resizing .col-rs::after { background: var(--primary); top: 0; bottom: 0
 .er-unmatched { color: var(--red); }
 .er-foot { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
 .er-price { font-size: 11px; color: var(--green); font-weight: 600; }
-.er-del {
-  margin-left: auto; background: none; border: none; cursor: pointer;
+.er-acts { margin-left: auto; display: flex; align-items: center; gap: 2px; }
+.er-edit, .er-del {
+  background: none; border: none; cursor: pointer;
   color: var(--text3); padding: 2px; border-radius: 5px; display: flex;
 }
+.er-edit:hover { background: var(--primary-light); color: var(--primary); }
 .er-del:hover { background: var(--red-bg); color: var(--red); }
+
+/* ---- 月末统计：编号拖动改归类 ---- */
+.entry-row[draggable="true"] { cursor: grab; }
+.entry-row[draggable="true"]:active { cursor: grabbing; }
+.entry-row.dragging {
+  opacity: .45; background: var(--primary-light);
+  box-shadow: 0 8px 20px rgba(37,99,235,.2);
+}
+.type-col.drop-hover {
+  border-color: var(--primary); background: #f2f7ff;
+  box-shadow: 0 0 0 3px rgba(37,99,235,.16);
+}
+.plat-card.drop-hover { box-shadow: 0 0 0 3px rgba(37,99,235,.22); }
+.mh-hint {
+  font-size: 12px; color: var(--text3);
+  background: var(--gray-bg); border-radius: 6px; padding: 2px 8px;
+}
 
 /* 填报弹窗：四个类型各一个输入框 */
 .type-grid .type-input {

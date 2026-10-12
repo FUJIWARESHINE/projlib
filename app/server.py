@@ -509,6 +509,26 @@ def api_delete_month(_q, _b, mid):
     return ok(True)
 
 
+def api_update_month(_q, body, mid):
+    """改月份名称 / 年份 / 月份。仅管理员（在 ADMIN_KEY_SET 里）。
+
+    月份建错（把 9 月建成 10 月）时直接改回来，已填报的编号一条都不会丢。
+    字段不传 = 不改。
+    """
+    y = body.get("year")
+    mo = body.get("month")
+    try:
+        m = db.update_month(
+            mid,
+            name=body.get("name"),
+            year=None if y in (None, "") else y,
+            month=None if mo in (None, "") else mo,
+        )
+        return ok({"month": m})
+    except Exception as exc:  # noqa: BLE001
+        return fail(str(exc))
+
+
 def api_month_detail(_q, _b, mid, ctx=None):
     detail = db.month_detail(mid)
     if not detail:
@@ -573,6 +593,51 @@ def api_month_add_entries(_q, body, mid, ctx):
         return fail(str(exc))
 
 
+def api_month_sync_entries(_q, body, mid, ctx):
+    """整平台一次编辑填报编号（前端卡片上的「编辑编号」弹窗）。
+
+    收 {"platform", "groups":[{"ptype","codes"|"codes文本"}, ...]}，
+    语义是**整体替换**该平台当月的填报：提交里没有的旧编号会被删掉，
+    所以前端必须把四类现有编号全部回填（留空 = 该类型下没有编号）。
+
+    权限与添加编号一致：对该平台有填写权限即可（管理员 = 全部平台）。
+    特意**不放进 ADMIN_KEY_SET**，否则实验员就改不了自己平台的编号了。
+    """
+    user = (ctx or {}).get("user") or {}
+    platform = (body.get("platform") or "").strip()
+    if not auth.can_edit_platform(user, platform):
+        return fail("你没有该平台板块的填写权限", 403)
+    month = db.get_month(mid)
+    if not month:
+        return fail("该月份不存在", 404)
+    if month["status"] == "locked":
+        return fail("该月份已锁定，无法修改")
+
+    groups = body.get("groups")
+    if not isinstance(groups, list) or not groups:
+        return fail("缺少 groups 参数", 400)
+    norm = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        ptype = (g.get("ptype") or "").strip()
+        codes = g.get("codes")
+        if isinstance(codes, str):
+            codes = _split_codes(codes)
+        codes = [str(c).strip() for c in (codes or []) if str(c).strip()]
+        if ptype:
+            norm.append((ptype, codes))
+    if not norm:
+        return fail("请至少提交一个类型", 400)
+
+    try:
+        r = db.sync_entries(mid, platform, norm, user_id=user.get("id") or 0)
+        r["platform_label"] = db.PLATFORM_LABEL.get(platform, platform)
+        return ok(r)
+    except Exception as exc:  # noqa: BLE001
+        return fail(str(exc))
+
+
 def api_month_delete_entry(_q, _b, mid, eid, ctx):
     user = (ctx or {}).get("user") or {}
     with db.tx() as conn:
@@ -583,6 +648,54 @@ def api_month_delete_entry(_q, _b, mid, eid, ctx):
         return fail("你没有该平台板块的操作权限", 403)
     db.delete_entry(eid)
     return ok(True)
+
+
+def api_month_move_entry(_q, body, mid, eid, ctx):
+    """改一条填报记录的编号 / 类型 / 平台（月末统计里拖动编号、弹窗再编辑都用它）。
+
+    只收 {platform?, ptype?, code?}，都可省（省 = 保持原值）。
+    权限：对**原平台**和**目标平台**都要有填写权限（管理员全能，实验员只动得了自己的平台）。
+    """
+    user = (ctx or {}).get("user") or {}
+    with db.tx() as conn:
+        row = conn.execute("SELECT * FROM month_entries WHERE id=?", (eid,)).fetchone()
+    if not row:
+        return fail("记录不存在", 404)
+    row = dict(row)
+    if int(row["month_id"]) != int(mid):
+        return fail("记录不属于该月份", 400)
+    if not auth.can_edit_platform(user, row["platform"]):
+        return fail("你没有该平台板块的操作权限", 403)
+    month = db.get_month(mid)
+    if not month:
+        return fail("该月份不存在", 404)
+    if month["status"] == "locked":
+        return fail("该月份已锁定，无法修改")
+
+    ptype = (body.get("ptype") or "").strip() or row["ptype"]
+    platform = (body.get("platform") or "").strip() or row["platform"]
+    raw_code = body.get("code")
+    code = str(raw_code).strip() if raw_code is not None else ""
+    if raw_code is not None and not code:
+        return fail("项目编号不能为空", 400)   # 明确传了空编号 = 非法（不传才是「不改」）
+    if platform not in db.PLATFORM_KEYS:
+        return fail("平台不合法", 400)
+    if ptype not in db.TYPE_NAME:
+        return fail("项目类型不合法", 400)
+    if not auth.can_edit_platform(user, platform):
+        return fail("你没有目标平台板块的操作权限", 403)
+    try:
+        r = db.update_entry(eid, platform=platform, ptype=ptype, code=code)
+        if r.get("conflict"):
+            tgt = r.get("target") or {}
+            return fail(
+                f"{db.TYPE_NAME.get(tgt.get('ptype') or ptype, ptype)} 下已经有 "
+                f"{tgt.get('code') or code} 了，未修改", 409)
+        r["type_label"] = db.TYPE_NAME.get(ptype, ptype)
+        r["platform_label"] = db.PLATFORM_LABEL.get(platform, platform)
+        return ok(r)
+    except Exception as exc:  # noqa: BLE001
+        return fail(str(exc))
 
 
 def api_month_lock(_q, body, mid):
@@ -784,8 +897,11 @@ ROUTES = [
     ("GET", re.compile(r"^/api/months$"), api_months),
     ("POST", re.compile(r"^/api/months$"), api_create_month),
     ("GET", re.compile(r"^/api/months/(\d+)$"), api_month_detail),
+    ("PUT", re.compile(r"^/api/months/(\d+)$"), api_update_month),
     ("DELETE", re.compile(r"^/api/months/(\d+)$"), api_delete_month),
     ("POST", re.compile(r"^/api/months/(\d+)/entries$"), api_month_add_entries),
+    ("PUT", re.compile(r"^/api/months/(\d+)/entries$"), api_month_sync_entries),
+    ("PUT", re.compile(r"^/api/months/(\d+)/entries/(\d+)$"), api_month_move_entry),
     ("DELETE", re.compile(r"^/api/months/(\d+)/entries/(\d+)$"), api_month_delete_entry),
     ("POST", re.compile(r"^/api/months/(\d+)/lock$"), api_month_lock),
     ("POST", re.compile(r"^/api/months/(\d+)/export$"), api_month_export),
@@ -810,7 +926,9 @@ ROUTES = [
 
 # 处理函数需要拿到「当前登录用户」的接口（作为关键字参数 ctx 传入）
 CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
-             api_month_add_entries, api_month_delete_entry, api_month_export,
+             api_month_add_entries, api_month_sync_entries, api_month_move_entry,
+             api_month_delete_entry,
+             api_month_export,
              api_set_platform_status,
              api_worklogs_list, api_worklog_create, api_worklog_update,
              api_worklog_delete, api_worklog_summary}
@@ -882,6 +1000,7 @@ ADMIN_KEY_SET = {
     ("/api/export/all", "GET"), ("/api/export/multi", "POST"),
     ("/api/system/backup", "POST"), ("/api/system/package", "POST"),
     ("/api/months", "POST"),            # 创建月份仅管理员
+    ("/api/months/*", "PUT"),           # 改月份名称 / 年月（建错时修正）
     ("/api/months/*", "DELETE"),
     ("/api/months/*/lock", "POST"),
     ("/api/months/*/export", "POST"),

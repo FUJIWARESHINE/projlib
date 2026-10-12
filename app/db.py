@@ -778,6 +778,52 @@ def delete_month(mid: int) -> None:
         conn.execute("DELETE FROM months WHERE id=?", (mid,))
 
 
+def update_month(mid: int, name=None, year=None, month=None) -> dict:
+    """改月份名称 / 年份 / 月份（月份建错了不必删库重建）。
+
+    - 只更新显式传入的字段（None = 保持原值），所以「只改名」或「只改年月」都能用。
+    - 名称仍受 UNIQUE(name) 约束；已填写的填报明细（month_entries）完全不动。
+    """
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM months WHERE id=?", (mid,)).fetchone()
+        if not row:
+            raise ValueError("该月份不存在")
+        sets, args = [], []
+        if name is not None:
+            nm = str(name).strip()
+            if not nm:
+                raise ValueError("月份名称不能为空")
+            if conn.execute("SELECT id FROM months WHERE name=? AND id<>?",
+                            (nm, mid)).fetchone():
+                raise ValueError(f"「{nm}」已存在")
+            sets.append("name=?")
+            args.append(nm)
+        if year is not None and str(year).strip() != "":
+            try:
+                yv = int(year)
+            except (TypeError, ValueError):
+                raise ValueError("年份不合法")
+            if yv and not (1900 <= yv <= 2200):
+                raise ValueError("年份需在 1900-2200 之间")
+            sets.append("year=?")
+            args.append(yv)
+        if month is not None and str(month).strip() != "":
+            try:
+                mv = int(month)
+            except (TypeError, ValueError):
+                raise ValueError("月份不合法")
+            if mv and not (1 <= mv <= 12):
+                raise ValueError("月份需在 1-12 之间")
+            sets.append("month=?")
+            args.append(mv)
+        if not sets:
+            return _month_public(dict(row))
+        args.append(mid)
+        conn.execute(f"UPDATE months SET {', '.join(sets)} WHERE id=?", args)
+        return _month_public(dict(conn.execute(
+            "SELECT * FROM months WHERE id=?", (mid,)).fetchone()))
+
+
 def set_month_status(mid: int, status: str) -> None:
     if status not in ("open", "locked"):
         raise ValueError("状态不合法")
@@ -857,9 +903,132 @@ def add_entries(mid: int, platform: str, ptype: str, codes: list, user_id: int =
     return {"added": added, "skipped": skipped}
 
 
+def sync_entries(mid: int, platform: str, groups: list, user_id: int = 0) -> dict:
+    """把某月份、某平台的填报**整体同步**成提交的内容（月末「编辑编号」弹窗用）。
+
+    与逐条增删的差别：这是「所见即所得」的整体替换 ——
+      · 提交里没有的旧编号 → 删除；
+      · 编号还在但换了类型 → **原地改 ptype**（记录 id 不变，填报人不变）；
+      · 新出现的编号 → 新增；
+      · 什么都没变的 → 原样保留。
+
+    groups = [(ptype, [code, ...]), ...]，本次提交的全部编号（四类一起给）。
+    前端弹窗会把该平台四类现有编号**全部回填**，所以某个类型框留空 = 该类型下没有编号。
+    ※ 同一编号出现在两个类型下会各记一条（唯一键含 ptype），这是允许的。
+    """
+    platform = (platform or "").strip()
+    if platform not in PLATFORM_KEYS:
+        raise ValueError("平台不合法")
+
+    targets, seen, by_type = [], set(), {}
+    for ptype, codes in groups or []:
+        ptype = (ptype or "").strip()
+        if ptype not in TYPE_NAME:
+            raise ValueError("项目类型不合法")
+        for c in codes or []:
+            code = str(c).strip().upper()
+            if not code or (ptype, code) in seen:
+                continue
+            seen.add((ptype, code))
+            targets.append((ptype, code))
+            by_type[ptype] = by_type.get(ptype, 0) + 1
+
+    added, moved, removed, kept = [], [], [], 0
+    with tx() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM month_entries WHERE month_id=? AND platform=? ORDER BY id",
+            (mid, platform))]
+        pool = {}
+        for r in rows:
+            pool.setdefault(str(r["code"]).upper(), []).append(r)
+
+        used = set()
+        for ptype, code in targets:
+            cands = pool.get(code) or []
+            pick = None
+            for r in cands:            # 优先同类型那一条：单纯改名不算「改归类」
+                if r["id"] not in used and r["ptype"] == ptype:
+                    pick = r
+                    break
+            if pick is None:           # 退一步：同编号但类型变了 → 原地改 ptype
+                for r in cands:
+                    if r["id"] not in used:
+                        pick = r
+                        break
+            if pick is None:           # 全新的编号
+                conn.execute(
+                    "INSERT INTO month_entries(month_id,platform,ptype,code,user_id,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (mid, platform, ptype, code, user_id, _now()))
+                added.append(code)
+            else:
+                used.add(pick["id"])
+                if pick["ptype"] != ptype:
+                    conn.execute(
+                        "UPDATE month_entries SET ptype=?, updated_at=? WHERE id=?",
+                        (ptype, _now(), pick["id"]))
+                    moved.append({"code": code, "from": pick["ptype"], "to": ptype})
+                else:
+                    kept += 1
+
+        for r in rows:
+            if r["id"] not in used:
+                conn.execute("DELETE FROM month_entries WHERE id=?", (r["id"],))
+                removed.append({"code": r["code"], "ptype": r["ptype"]})
+
+    return {"added": len(added), "added_codes": added,
+            "moved": len(moved), "moved_items": moved,
+            "removed": len(removed), "removed_items": removed,
+            "kept": kept, "total": len(targets), "by_type": by_type}
+
+
 def delete_entry(eid: int) -> None:
     with tx() as conn:
         conn.execute("DELETE FROM month_entries WHERE id=?", (eid,))
+
+
+def update_entry(eid: int, platform: str = "", ptype: str = "", code: str = "") -> dict:
+    """改一条填报记录的**编号 / 类型 / 平台**（月末统计里拖动归类、弹窗再编辑都用它）。
+
+    - 三个参数留空表示保持原值，所以「只换类型」「只换平台」「只改编号」都能用。
+    - 与原记录完全一致时原样返回（unchanged）。
+    - 目标位置**已存在**同编号记录时不覆盖、不重复插入，返回 conflict=True，
+      由前端提示用户，绝不静默丢数据。
+    """
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM month_entries WHERE id=?", (eid,)).fetchone()
+        if not row:
+            raise ValueError("记录不存在")
+        row = dict(row)
+        newp = (platform or row["platform"] or "").strip()
+        newt = (ptype or row["ptype"] or "").strip()
+        # 编号统一大写（项目库编号均为大写，小写输入也能正确判重）
+        newc = str(code or row["code"] or "").strip().upper()
+        if not newc:
+            raise ValueError("项目编号不能为空")
+        if newp not in PLATFORM_KEYS:
+            raise ValueError("平台不合法")
+        if newt not in TYPE_NAME:
+            raise ValueError("项目类型不合法")
+        if (newp == row["platform"] and newt == row["ptype"]
+                and newc == str(row["code"]).upper()):
+            return {"moved": False, "unchanged": True, "entry": row}
+        dup = conn.execute(
+            "SELECT id FROM month_entries WHERE month_id=? AND platform=? AND ptype=? "
+            "AND UPPER(code)=? AND id<>?",
+            (row["month_id"], newp, newt, newc, eid)).fetchone()
+        if dup:
+            return {"moved": False, "conflict": True, "conflict_id": dup["id"],
+                    "entry": row, "target": {"platform": newp, "ptype": newt, "code": newc}}
+        conn.execute(
+            "UPDATE month_entries SET platform=?, ptype=?, code=?, updated_at=? WHERE id=?",
+            (newp, newt, newc, _now(), eid))
+        new_row = dict(conn.execute(
+            "SELECT * FROM month_entries WHERE id=?", (eid,)).fetchone())
+        return {
+            "moved": True, "entry": new_row,
+            "from": {"platform": row["platform"], "ptype": row["ptype"], "code": row["code"]},
+        }
 
 
 def clear_entries(mid: int, platform: str = "", ptype: str = "") -> int:

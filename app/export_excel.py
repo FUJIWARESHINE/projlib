@@ -381,135 +381,225 @@ def export_lookup_report(rows_by_type: dict, missing_by_type: dict, title: str =
 # 新版式：标题区 + 四平台分区（细胞 / 分子 / 病理 / 动物）
 # 每个平台分区内按 类型（真实/加急/库存/返修）分组，列出当月完成的编号。
 MONTH_FONT = "微软雅黑"
-M_HEAD = "1F4E79"          # 深蓝表头
+# 一级表头底色：用户 2026-10-12 指定 —— 第 3 行整行统一用「项目名」列的颜色 + 白字
+M_HEAD = "2E75B6"
 M_TITLE = "17375E"
+# 副标题（第 2 行）：用户指定 黄底 + 红字
+M_SUB_FILL = "FFD966"
+M_SUB_TEXT = "C00000"
+# 四平台色：**只用于数据区「√」的字色**（表头两行已统一成 M_HEAD，不要再拿去铺表头）
 M_PLAT_COLORS = ["1D9E75", "378ADD", "BA7517", "7F77DD"]   # 细胞/分子/病理/动物
 M_TYPE_TAG = {              # 类型标签底色
     "real": "EAF3DE", "urgent": "FAEEDA", "stock": "E6F1FB", "repair": "FCEBEB",
 }
 M_TYPE_TEXT = {"real": "3B6D11", "urgent": "854F0B", "stock": "185FA5", "repair": "A32D2D"}
+# 数据区降噪（2026-10-12）：参与情况的「√」只上平台字色、不铺底色；
+# 「未完成 / 库中未找到」只上字色、不铺底色（仅「已完成」保留浅绿底）。
+# A 列大栏名（竖向四大模块）
+M_BLOCK_LABELS = {"real": "真实", "urgent": "加急", "stock": "库存", "repair": "返修"}
 
 M_WIDTHS = [7, 15, 42, 12, 10, 10, 10, 10, 13]
 
 
+def _code_sort_key(code: str):
+    """编号排序：首字母 → 长度 → 字典序（与项目库列表的默认排序一致）。"""
+    c = str(code or "").upper()
+    return (c[:1], len(c), c)
+
+
+def _month_done(lib_row, plats: list) -> str:
+    """月末表的「完成情况」：按**项目库**判定（与项目库列表口径一致）。
+
+    已设计的平台（值 ≠ "/"）全部 ✅ → 已完成；有一个未完成（含空白=已设计未完成）→ 未完成；
+    项目库里根本没有这个 (类型, 编号) → 库中未找到。
+    """
+    if not lib_row:
+        return "库中未找到"
+    return _overall_done(lib_row, plats)
+
+
+def _head_cell(cell, color: str) -> None:
+    cell.font = Font(name=MONTH_FONT, size=10, bold=True, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor=color)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
 def export_month_stat(detail: dict) -> str:
-    """导出月末项目统计表（按月 + 四平台板块）。"""
+    """导出月末项目统计表。
+
+    版式（竖向四大模块 + 横向平台/完成情况）：
+      A 大栏（真实 / 加急 / 库存 / 返修，纵向合并）
+      B 项目编号 ｜ C 项目名 ｜ D 报价
+      E-H 参与情况（细胞 / 分子 / 病理 / 动物：本月哪个平台填了这个编号就打 √）
+      I 完成情况（按项目库判定：该项目所有已设计平台都是 ✅ → 已完成，否则未完成）
+
+    同一编号被多个平台填报时只占一行，√ 落在各自平台列下。
+    """
     month = detail.get("month") or {}
     platforms = detail.get("platforms") or []
+    plats = [(p.get("key") or "", p.get("label") or "") for p in platforms]
     mname = month.get("name") or "月末项目统计"
 
+    # ---- 各平台填报按 (类型, 编号) 合并成一行
+    merged, order = {}, []
+    for p in platforms:
+        pkey = p.get("key") or ""
+        for it in p.get("items") or []:
+            key = ((it.get("ptype") or ""), str(it.get("code") or "").upper())
+            r = merged.get(key)
+            if r is None:
+                r = {"ptype": key[0], "code": it.get("code") or "",
+                     "name": it.get("name") or "", "price": it.get("price") or 0,
+                     "matched": bool(it.get("matched")), "plats": []}
+                merged[key] = r
+                order.append(key)
+            elif it.get("matched") and not r["matched"]:
+                # 同编号被多个平台填报：名称 / 报价取匹配到项目库的那一份
+                r["name"] = it.get("name") or ""
+                r["price"] = it.get("price") or 0
+                r["matched"] = True
+            if pkey and pkey not in r["plats"]:
+                r["plats"].append(pkey)
+
+    # ---- 项目库索引（完成情况要看平台状态列）
+    lib = {}
+    for row in db.all_projects():
+        lib.setdefault((row["ptype"], str(row["code"]).upper()), row)
+    for key in order:
+        r = merged[key]
+        r["lib"] = lib.get(key)
+        r["done"] = _month_done(r["lib"], plats)
+
+    # ---- 建表
     wb = Workbook()
     ws = wb.active
     ws.title = "月末统计"
-    for i, w in enumerate(M_WIDTHS, start=1):
+    ncols = 4 + len(plats) + 1        # A 大栏 + 编号/项目名/报价 + 平台列 + 完成情况
+    widths = ([9, 15, 47, 13] + [11] * len(plats) + [14])
+    for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     _setup_page(ws)
-
-    ncols = len(M_WIDTHS)
     last_col = get_column_letter(ncols)
 
-    # ---- 标题
+    n_done = sum(1 for k in order if merged[k]["done"] == "已完成")
+    n_undone = sum(1 for k in order if merged[k]["done"] == "未完成")
+    n_miss = sum(1 for k in order if merged[k]["done"] == "库中未找到")
+
+    # ---- 标题 / 副标题（沿用原来的配色）
     ws.merge_cells(f"A1:{last_col}1")
     t = ws["A1"]
-    t.value = f"{mname} · 项目完成情况统计"
+    t.value = f"{mname} · 项目参与与完成情况"
     t.font = Font(name=MONTH_FONT, size=16, bold=True, color="FFFFFF")
     t.fill = PatternFill("solid", fgColor=M_TITLE)
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 40
 
-    # ---- 副标题（总计）
-    total = detail.get("total") or 0
-    parts = " · ".join(f"{p['label']} {p['count']} 项" for p in platforms)
+    sub = (f"共 {len(order)} 个项目 / {detail.get('total') or 0} 条填报"
+           f"    |    已完成 {n_done} · 未完成 {n_undone}")
+    if n_miss:
+        sub += f" · 库中未找到 {n_miss}"
+    counts = " · ".join(f"{p.get('label')} {p.get('count') or 0} 项" for p in platforms)
+    if counts:
+        sub += f"    |    {counts}"
     ws.merge_cells(f"A2:{last_col}2")
     s = ws["A2"]
-    s.value = f"共完成 {total} 项    |    {parts}"
-    s.font = Font(name=MONTH_FONT, size=10, color="FFFFFF")
-    s.fill = PatternFill("solid", fgColor="2E5C8A")
+    s.value = sub
+    s.font = Font(name=MONTH_FONT, size=10, color=M_SUB_TEXT)
+    s.fill = PatternFill("solid", fgColor=M_SUB_FILL)
     s.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[2].height = 24
 
-    row = 4
-    for pi, plat in enumerate(platforms):
-        color = M_PLAT_COLORS[pi % len(M_PLAT_COLORS)]
-        # ---- 平台分区标题条
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
-        head = ws.cell(row=row, column=1)
-        head.value = f"  {plat['label']}平台    （{plat['count']} 项）"
-        head.font = Font(name=MONTH_FONT, size=12, bold=True, color="FFFFFF")
-        head.fill = PatternFill("solid", fgColor=color)
-        head.alignment = Alignment(horizontal="left", vertical="center")
-        for c in range(1, ncols + 1):
-            ws.cell(row=row, column=c).border = BORDER
-            ws.cell(row=row, column=c).fill = PatternFill("solid", fgColor=color)
-        ws.row_dimensions[row].height = 26
-        row += 1
+    # ---- 两级表头（第 3-4 行）
+    h1, h2 = 3, 4
+    ws.merge_cells("A3:A4")
+    ws.merge_cells("B3:B4")
+    ws.merge_cells("C3:C4")
+    ws.merge_cells("D3:D4")
+    if plats:
+        ws.merge_cells(start_row=h1, start_column=5, end_row=h1, end_column=4 + len(plats))
+    ws.merge_cells(start_row=h1, start_column=ncols, end_row=h2, end_column=ncols)
+    # 表头两行（第 3-4 行）整体统一底色（用户指定：用「项目名」列的颜色 + 白字）
+    for col, val in ((1, ""), (2, "项目编号"), (3, "项目名"), (4, "报价"),
+                     (5, "参与情况"), (ncols, "完成情况")):
+        _head_cell(ws.cell(row=h1, column=col, value=val), M_HEAD)
+    for i, (_k, lab) in enumerate(plats):
+        _head_cell(ws.cell(row=h2, column=5 + i, value=lab), M_HEAD)
+    for rr in (h1, h2):
+        for col in range(1, ncols + 1):
+            ws.cell(row=rr, column=col).border = BORDER
+    ws.row_dimensions[h1].height = 26
+    ws.row_dimensions[h2].height = 22
 
-        items = plat.get("items") or []
-        if not items:
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
-            e = ws.cell(row=row, column=1)
-            e.value = "（该平台本月暂无填写）"
-            e.font = Font(name=MONTH_FONT, size=10, color="94A3B8")
-            e.alignment = Alignment(horizontal="center", vertical="center")
-            for c in range(1, ncols + 1):
-                ws.cell(row=row, column=c).border = BORDER
-            ws.row_dimensions[row].height = 22
-            row += 2
+    # ---- 四大模块（真实 → 加急 → 库存 → 返修），模块名写 A 列并纵向合并
+    row = h2 + 1
+    wrote = False
+    for ptype, _plabel in db.TYPES:
+        grp = [merged[k] for k in order if k[0] == ptype]
+        if not grp:
             continue
+        grp.sort(key=lambda r: _code_sort_key(r["code"]))
+        start = row
+        for r in grp:
+            ws.cell(row=row, column=2, value=r["code"])
+            ws.cell(row=row, column=3,
+                    value=(r["name"] if r["matched"] else "（项目库中没有这个编号）"))
+            ws.cell(row=row, column=4, value=_price_cell(r["lib"] or {"ptype": ptype}))
+            for i, (pkey, _lab) in enumerate(plats):
+                if pkey in r["plats"]:
+                    ws.cell(row=row, column=5 + i, value="√")
+            ws.cell(row=row, column=ncols, value=r["done"])
 
-        # ---- 表头
-        headers = ["序号", "项目编号", "项目名", "报价", "真实", "加急", "库存", "返修", "备注"]
-        for ci, h in enumerate(headers, start=1):
-            cell = ws.cell(row=row, column=ci, value=h)
-            cell.font = Font(name=MONTH_FONT, size=10, bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor=M_HEAD)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = BORDER
-        ws.row_dimensions[row].height = 22
-        row += 1
-
-        # ---- 明细
-        for idx, it in enumerate(items, start=1):
-            vals = [idx, it.get("code") or "", it.get("name") or "",
-                    (it.get("price") or 0) or "", "", "", "", "", ""]
-            pt = it.get("ptype") or ""
-            # 在对应类型列打「√」
-            type_col = {"real": 5, "urgent": 6, "stock": 7, "repair": 8}.get(pt)
-            if type_col:
-                vals[type_col - 1] = "√"
-            for ci, v in enumerate(vals, start=1):
-                cell = ws.cell(row=row, column=ci, value=v)
-                cell.font = Font(name=MONTH_FONT, size=10)
+            # 先铺默认样式，再逐个覆盖
+            for col in range(1, ncols + 1):
+                cell = ws.cell(row=row, column=col)
                 cell.border = BORDER
+                cell.font = Font(name=MONTH_FONT, size=10)
                 cell.alignment = Alignment(
-                    horizontal="left" if ci == 3 else "center", vertical="center",
-                    wrap_text=(ci == 3))
-                if ci == 4 and v not in ("", None):
-                    cell.number_format = "#,##0"
-            # 类型列着色
-            if type_col:
-                tc = ws.cell(row=row, column=type_col)
-                tc.font = Font(name=MONTH_FONT, size=10, bold=True,
-                               color=M_TYPE_TEXT.get(pt, "000000"))
-                tc.fill = PatternFill("solid", fgColor=M_TYPE_TAG.get(pt, "FFFFFF"))
-            if not it.get("matched", True):
-                ws.cell(row=row, column=2).font = Font(
-                    name=MONTH_FONT, size=10, color="DC2626", bold=True)
-                ws.cell(row=row, column=9, value="库中未找到该编号")
-                ws.cell(row=row, column=9).font = Font(
-                    name=MONTH_FONT, size=9, color="DC2626")
-            ws.row_dimensions[row].height = 20
+                    horizontal="left" if col == 3 else "center",
+                    vertical="center", wrap_text=(col == 3))
+            c2 = ws.cell(row=row, column=2)
+            c2.font = Font(name=MONTH_FONT, size=10, bold=True)
+            if not r["matched"]:
+                c2.font = Font(name=MONTH_FONT, size=10, bold=True, color="DC2626")
+                ws.cell(row=row, column=3).font = Font(
+                    name=MONTH_FONT, size=10, color="DC2626")
+            if isinstance(ws.cell(row=row, column=4).value, (int, float)):
+                ws.cell(row=row, column=4).number_format = "#,##0"
+            for i, (pkey, _lab) in enumerate(plats):
+                if pkey in r["plats"]:
+                    cc = ws.cell(row=row, column=5 + i)
+                    cc.font = Font(name=MONTH_FONT, size=12, bold=True,
+                                   color=M_PLAT_COLORS[i % len(M_PLAT_COLORS)])
+            dc = ws.cell(row=row, column=ncols)
+            if r["done"] == "已完成":
+                dc.font = Font(name=MONTH_FONT, size=10, bold=True, color="16A34A")
+                dc.fill = PatternFill("solid", fgColor="DCFCE7")
+            elif r["done"] == "未完成":
+                dc.font = Font(name=MONTH_FONT, size=10, color="000000")
+            else:
+                dc.font = Font(name=MONTH_FONT, size=10, color="D97706")
             row += 1
-        row += 1   # 平台之间空一行
 
-    # ---- 页脚说明
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
-    f = ws.cell(row=row, column=1)
-    f.value = (f"导出时间：{datetime.now():%Y-%m-%d %H:%M}    "
-               f"｜ 本表由「项目库统计程序」自动生成")
-    f.font = Font(name=MONTH_FONT, size=9, color="5F5E5A")
-    f.alignment = Alignment(horizontal="right", vertical="center")
-    ws.row_dimensions[row].height = 20
+        if row - 1 > start:          # 只有一行时不合并（避免 A12:A12 这种空合并）
+            ws.merge_cells(start_row=start, start_column=1, end_row=row - 1, end_column=1)
+        gc = ws.cell(row=start, column=1, value=M_BLOCK_LABELS.get(ptype, ptype))
+        gc.font = Font(name=MONTH_FONT, size=11, bold=True,
+                       color=M_TYPE_TEXT.get(ptype, "000000"))
+        gc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for rr in range(start, row):
+            a = ws.cell(row=rr, column=1)
+            a.border = BORDER
+            a.fill = PatternFill("solid", fgColor=M_TYPE_TAG.get(ptype, "FFFFFF"))
+        wrote = True
+
+    if not wrote:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
+        e = ws.cell(row=row, column=1, value="本月暂无填报数据")
+        e.font = Font(name=MONTH_FONT, size=11, color="94A3B8")
+        e.alignment = Alignment(horizontal="center", vertical="center")
+        for col in range(1, ncols + 1):
+            ws.cell(row=row, column=col).border = BORDER
+        ws.row_dimensions[row].height = 26
 
     name = f"月末项目统计_{_safe_name(mname)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     path = os.path.join(_export_dir(), name)
