@@ -24,6 +24,10 @@ AMBER = "D97706"
 THIN = Side(style="thin", color="9DA9BF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
+# 报价列数字格式：带人民币符号（与源表 / 用户模板口径一致，负数标红）
+#   `\¥` 里的反斜杠是 Excel 的转义，保证「¥」按字面输出
+MONEY_FMT = "\\¥#,##0;[Red]\\¥-#,##0"
+
 _HEAD_FILL = PatternFill("solid", fgColor=BLUE)
 _HEAD_FONT = Font(name=FONT, size=10, bold=True, color="FFFFFF")
 _BODY_FONT = Font(name=FONT, size=10)
@@ -172,7 +176,9 @@ def export_summary(rows: list, missing: list = None, title: str = "",
             code = r.get("code") or ""
             ws.cell(row=row, column=2, value=code)
             ws.cell(row=row, column=3, value=r.get("name") or "")
-            ws.cell(row=row, column=4, value=_price_cell(r))
+            _pc = ws.cell(row=row, column=4, value=_price_cell(r))
+            if isinstance(_pc.value, (int, float)):
+                _pc.number_format = MONEY_FMT
             # 参与平台：只要「设计了」（值 ≠ "/"，含空白=已设计未完成）就写上编号
             for pi, (pkey, _plabel) in enumerate(platforms):
                 pv = (r.get(pkey) or "").strip()
@@ -330,7 +336,9 @@ def _write_stat_sheet(ws, rows: list, missing: list, title: str, platforms) -> N
             code = r.get("code") or ""
             ws.cell(row=row, column=2, value=code)
             ws.cell(row=row, column=3, value=r.get("name") or "")
-            ws.cell(row=row, column=4, value=_price_cell(r))
+            _pc = ws.cell(row=row, column=4, value=_price_cell(r))
+            if isinstance(_pc.value, (int, float)):
+                _pc.number_format = MONEY_FMT
             for pi, (pkey, _pl) in enumerate(platforms):
                 pv = (r.get(pkey) or "").strip()
                 if pv != db.ST_NONE:      # 排除「/」未设计；空白=已设计未完成，要写
@@ -571,7 +579,7 @@ def export_month_stat(detail: dict) -> str:
                 ws.cell(row=row, column=3).font = Font(
                     name=MONTH_FONT, size=10, color="DC2626")
             if isinstance(ws.cell(row=row, column=4).value, (int, float)):
-                ws.cell(row=row, column=4).number_format = "#,##0"
+                ws.cell(row=row, column=4).number_format = MONEY_FMT
             for i, (pkey, _lab) in enumerate(plats):
                 if pkey in r["plats"]:
                     cc = ws.cell(row=row, column=5 + i)
