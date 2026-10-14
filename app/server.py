@@ -39,7 +39,8 @@ PUBLIC_ROUTES = {
     ("POST", "/api/auth/login"),
 }
 
-# 仅管理员可访问的接口
+# 仅管理员可访问的接口（⚠️ 实际鉴权走下面的 ADMIN_KEY_SET；这份是按前缀的旧清单，
+#   只作参考保留，新增管理员接口记得两边都补）
 ADMIN_ROUTES = {
     ("GET", "/api/users"),
     ("POST", "/api/users"),
@@ -208,54 +209,58 @@ def _notify_after_import(result: dict, ctx) -> None:
     _safe_notify(_notify_import_created, items, created_by)
 
 
-def _notify_platform_done(before: dict, platform: str, value: str, user: dict) -> None:
-    """普通账户把某项目某平台勾成 ✅ → 通知全体管理员。
+def _notify_status_change(before: dict, after: dict, user: dict) -> None:
+    """项目平台状态写入后的通知分发（项目库列表内联点勾 / 编辑弹窗共用）。
 
-    只有「操作者不是管理员」且「该平台确实从非 ✅ 变成 ✅」时才播报，避免：
-      · 管理员自己勾选也通知自己；
-      · 重复点选 ✅ 反复刷屏。
-    平台完成后若项目**所有被设计平台**都已完成，再补一条「已结项，请审核」。
+    ① 平台完成（非 ✅ → ✅）：通知全体管理员。
+       **仅普通账户操作时播报** —— 管理员在项目库里替人勾选时不给自己刷屏。
+    ② 项目结项（未结项 → 已结项）：生成「待审核」单 + 通知全体管理员与全体审核员。
+       **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要进审核流程。
+       （早期版本把这段一起塞在「操作者不是管理员就 return」后面，
+        结果管理员点勾时审核员既收不到消息、project_audits 也不落单，
+        「待我审核」始终是空的 —— 这就是「开审核的账户收不到待审核」的根因。）
     """
-    if value != db.ST_DONE or not before:
-        return
-    if auth.is_admin(user):
-        return
-    if (before.get(platform) or "").strip() == db.ST_DONE:
+    if not before or not after:
         return
     uid = int((user or {}).get("id") or 0)
-    code = before.get("code") or ""
-    name = before.get("name") or ""
-    ptype = before.get("ptype") or ""
-    label = db.PLATFORM_LABEL.get(platform, platform)
+    pid = int(after.get("id") or 0)
+    code = after.get("code") or ""
+    name = after.get("name") or ""
+    ptype = after.get("ptype") or ""
     type_label = db.TYPE_NAME.get(ptype, ptype)
-    _safe_notify(db.add_notification,
-                 db.NOTIF_PLATFORM_DONE, db.ROLE_ADMIN,
-                 f"{code}项目{label}平台已完成",
-                 f"{type_label}｜{name}" if name else type_label,
-                 ptype=ptype, code=code, platform=platform,
-                 project_id=int(before.get("id") or 0), created_by=uid)
-    after = db.get_project(int(before.get("id") or 0))
-    st = db.project_status(after) if after else None
-    if st and st["completed"]:
-        done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st["done"])
-        # ① 通知全体管理员：已结项，请审核
-        _safe_notify(db.add_notification,
-                     db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
-                     f"{code}项目已结项，请审核",
-                     f"{type_label}｜{name}｜完成平台：{done_labels}",
-                     ptype=ptype, code=code,
-                     project_id=int(before.get("id") or 0), created_by=uid)
-        # ② 生成/重置「待审核」记录，并弹窗提醒有审核权限的普通账户
-        _safe_notify(db.upsert_audit, ptype, code,
-                     int(before.get("id") or 0), name)
-        if db.has_auditor():
+
+    # ① 各平台「未完成 → ✅」的增量播报（管理员自己操作时不发）
+    if not auth.is_admin(user):
+        for key, label in db.PLATFORMS:
+            if (after.get(key) or "").strip() != db.ST_DONE:
+                continue
+            if (before.get(key) or "").strip() == db.ST_DONE:
+                continue
             _safe_notify(db.add_notification,
-                         db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR,
-                         f"{code}项目已结项，请审核",
-                         f"{type_label}｜{name}｜完成平台：{done_labels}",
-                         ptype=ptype, code=code,
-                         project_id=int(before.get("id") or 0), popup=True,
-                         created_by=uid)
+                         db.NOTIF_PLATFORM_DONE, db.ROLE_ADMIN,
+                         f"{code}项目{label}平台已完成",
+                         f"{type_label}｜{name}" if name else type_label,
+                         ptype=ptype, code=code, platform=key,
+                         project_id=pid, created_by=uid)
+
+    # ② 结项：只在「未结项 → 已结项」这一次迁移上触发，重复点 ✅ 不会重复建单
+    st_before = db.project_status(before)
+    st_after = db.project_status(after)
+    if st_before["completed"] or not st_after["completed"]:
+        return
+    done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st_after["done"])
+    body = f"{type_label}｜{name}｜完成平台：{done_labels}"
+    _safe_notify(db.add_notification,
+                 db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
+                 f"{code}项目已结项，请审核", body,
+                 ptype=ptype, code=code, project_id=pid, created_by=uid)
+    _safe_notify(db.upsert_audit, ptype, code, pid, name)
+    if db.has_auditor():
+        _safe_notify(db.add_notification,
+                     db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR,
+                     f"{code}项目已结项，请审核", body,
+                     ptype=ptype, code=code, project_id=pid, popup=True,
+                     created_by=uid)
 
 
 def api_audits(query, _b, ctx=None):
@@ -281,7 +286,8 @@ def api_audit_done(_q, _b, aid, ctx=None):
     done = db.complete_audit(aid, user)
     if not done:
         return fail("该项目已经审核过了", 409, audit=db.get_audit(aid))
-    who = user.get("display_name") or user.get("username") or "审核员"
+    # 通知文案里的人名一律取账号**姓名**（db.person_label；账号没填姓名则写成「账号 xxx」）
+    who = db.person_label(user)
     # 事已办完 —— 把「我」那条「请审核」提醒收掉，别再挂在未读里、也别再弹横幅
     _safe_notify(db.mark_notif_read_for_project,
                  int(user.get("id") or 0), db.NOTIF_AUDIT_REQUEST,
@@ -301,9 +307,12 @@ def api_notifications(query, _b, ctx=None):
     ?unread=1 只取未读；?limit=N 限制条数。popups 恒为「未读且 popup=1」。
     受众按角色取：管理员只看管理员消息；普通账户看全员消息；
     有审核权限的普通账户再多看一份「结项待审核」。
+    ⚠️ 全服通告还要再按**平台**收窄：只有「不限平台」或明确包含自己岗位的通告才可见，
+    所以 roles 之外必须把当前用户的 platform 一起传下去。
     """
     user = (ctx or {}).get("user") or {}
     uid = int(user.get("id") or 0)
+    plat = str(user.get("platform") or "")
     roles = db.roles_for(user)
     try:
         limit = int(query.get("limit", ["200"])[0] or 200)
@@ -311,11 +320,13 @@ def api_notifications(query, _b, ctx=None):
         limit = 200
     only_unread = query.get("unread", [""])[0] in ("1", "true", "yes")
     items = db.list_notifications(uid, roles, limit=max(1, min(limit, 500)),
-                                  unread_only=only_unread)
+                                  unread_only=only_unread, platform=plat)
+    can_audit = bool(user.get("can_audit"))
     return ok({
         "items": items,
-        "unread": db.notif_unread_count(uid, roles),
-        "popups": db.notif_pending_popups(uid, roles),
+        # ★ 角标：审核员「待审核」的提醒恒算未读（只有点「审核完成」才消）
+        "unread": db.notif_unread_count(uid, roles, plat, can_audit=can_audit),
+        "popups": db.notif_pending_popups(uid, roles, platform=plat),
         "roles": roles,
         "can_audit": bool(user.get("can_audit")),
         # 有审核权限时带上「待我审核」清单，消息中心直接列出来
@@ -327,15 +338,17 @@ def api_notifications_read(_q, body, ctx=None):
     """标记已读：{ids:[...]} 指定条目标记；{all:true} 全部标记。"""
     user = (ctx or {}).get("user") or {}
     uid = int(user.get("id") or 0)
+    plat = str(user.get("platform") or "")
     roles = db.roles_for(user)
     if body.get("all"):
-        db.mark_notifications_read(uid, None, roles)
+        db.mark_notifications_read(uid, None, roles, plat)
     else:
         ids = body.get("ids") or []
         if not isinstance(ids, list):
             return fail("ids 参数不合法", 400)
-        db.mark_notifications_read(uid, ids, roles)
-    return ok({"unread": db.notif_unread_count(uid, roles)})
+        db.mark_notifications_read(uid, ids, roles, plat)
+    return ok({"unread": db.notif_unread_count(
+        uid, roles, plat, can_audit=bool(user.get("can_audit")))})
 
 
 def api_notifications_clear(_q, _b, ctx=None):
@@ -343,12 +356,77 @@ def api_notifications_clear(_q, _b, ctx=None):
 
     通知是按受众标签广播的，「清空」只对当前用户隐藏（写 hidden=1 的已读记录），
     别的账号照常能看到自己的消息；「待我审核」工作台不受影响。
+    ★ 待审核项目的「请审核」提醒清不掉 —— 项目没审核完成，红点与那条消息都必须留着。
     """
     user = (ctx or {}).get("user") or {}
     uid = int(user.get("id") or 0)
+    plat = str(user.get("platform") or "")
     roles = db.roles_for(user)
-    n = db.hide_notifications(uid, roles)
-    return ok({"cleared": n, "unread": db.notif_unread_count(uid, roles)})
+    n = db.hide_notifications(uid, roles, plat)
+    return ok({"cleared": n, "unread": db.notif_unread_count(
+        uid, roles, plat, can_audit=bool(user.get("can_audit")))})
+
+
+# ------------------------------------------------------------ 全服通告（管理员）
+# 例：月末了，管理员发布「请及时填写月末统计」，选定细胞 / 分子两个平台，
+# 两个平台的实验员登录后就会收到弹窗横幅，消息中心也留一条未读。
+# 平台留空 = 全体成员（含运营 / 设计）；已发布通告可在此页撤回。
+BROADCAST_MAX_TITLE = 60
+BROADCAST_MAX_BODY = 600
+
+
+def api_broadcasts(_q, _b, ctx=None):
+    """管理员：已发布通告列表 + 各平台人数（发布页显示「细胞 3 人」，便于估算受众）。"""
+    user = (ctx or {}).get("user") or {}
+    if not auth.is_admin(user):
+        return fail("需要管理员权限", 403)
+    counts = db.platform_member_counts()
+    platforms = [{"key": k, "label": db.SIGNUP_LABEL.get(k, k),
+                  "readonly": k in db.READONLY_PLATFORMS,
+                  "count": int(counts.get(k) or 0)}
+                 for k in db.BROADCAST_PLATFORM_KEYS]
+    return ok({"items": db.list_broadcasts(200), "platforms": platforms,
+               "total": int(counts.get("__total__") or 0)})
+
+
+def api_broadcast_create(_q, body, ctx=None):
+    """发布全服通告：{title, body, platforms:[平台键...], popup:true}。
+
+    platforms 为空数组 = 全体成员；popup=false 则只进消息中心、不弹横幅。
+    """
+    user = (ctx or {}).get("user") or {}
+    if not auth.is_admin(user):
+        return fail("需要管理员权限", 403)
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return fail("请填写通告标题", 400)
+    if len(title) > BROADCAST_MAX_TITLE:
+        return fail(f"标题最多 {BROADCAST_MAX_TITLE} 个字符", 400)
+    text = str(body.get("body") or "").strip()
+    if len(text) > BROADCAST_MAX_BODY:
+        return fail(f"正文最多 {BROADCAST_MAX_BODY} 个字符", 400)
+    platforms = body.get("platforms")
+    if platforms is None:
+        platforms = []
+    if not isinstance(platforms, list):
+        return fail("platforms 参数不合法", 400)
+    bad = [str(p) for p in platforms if str(p) not in db.BROADCAST_PLATFORM_KEYS]
+    if bad:
+        return fail("平台参数不合法：" + "、".join(bad[:4]), 400)
+    item = db.add_broadcast(title, text, [str(p) for p in platforms],
+                            bool(body.get("popup", True)),
+                            created_by=int(user.get("id") or 0))
+    return ok(item)
+
+
+def api_broadcast_delete(_q, _b, bid, ctx=None):
+    """撤回通告：从所有接收者的消息中心消失（连同已读记录一起删掉）。"""
+    user = (ctx or {}).get("user") or {}
+    if not auth.is_admin(user):
+        return fail("需要管理员权限", 403)
+    if not db.delete_broadcast(bid):
+        return fail("通告不存在或已被撤回", 404)
+    return ok({"id": int(bid)})
 
 
 # ------------------------------------------------------------------ 业务
@@ -443,14 +521,18 @@ def api_create_project(_q, body, ctx=None):
     return ok({"id": pid})
 
 
-def api_update_project(_q, body, pid):
+def api_update_project(_q, body, pid, ctx=None):
     # 归属类型可以改（项目从库存转加急等），但要挡住非法值
     ptype = str(body.get("ptype") or "").strip()
     if ptype and ptype not in _VALID_TYPES:
         return fail("项目类型不合法", 400)
-    if not db.get_project(pid):
+    before = db.get_project(pid)
+    if not before:
         return fail("项目不存在", 404)
     db.update_project(pid, body)
+    # 编辑弹窗里也能改平台状态（cell/mol/path/animal），
+    # 这条路径以前完全不通知 —— 管理员整套平台改成 ✅ 后审核员收不到待审核。
+    _notify_status_change(before, db.get_project(pid), (ctx or {}).get("user") or {})
     return ok(True)
 
 
@@ -472,8 +554,8 @@ def api_set_platform_status(_q, body, pid, ctx=None):
     if not before:
         return fail("项目不存在", 404)
     db.update_project(pid, {plat: value})
-    # 普通账户把平台勾成 ✅ → 通知管理员（含「项目已结项，请审核」）
-    _notify_platform_done(before, plat, value, user)
+    # 平台状态变更 → 通知管理员 / 结项进审核（普通账户与管理员都走同一条逻辑）
+    _notify_status_change(before, db.get_project(pid), user)
     return ok({"platform": plat, "value": value})
 
 
@@ -1174,6 +1256,10 @@ ROUTES = [
     # ---- 结项审核（有审核权限的普通账户；管理员也能看）
     ("GET", re.compile(r"^/api/audits$"), api_audits),
     ("POST", re.compile(r"^/api/audits/(\d+)/done$"), api_audit_done),
+    # ---- 全服通告（仅管理员：发布 / 查看已发布 / 撤回）
+    ("GET", re.compile(r"^/api/broadcasts$"), api_broadcasts),
+    ("POST", re.compile(r"^/api/broadcasts$"), api_broadcast_create),
+    ("DELETE", re.compile(r"^/api/broadcasts/(\d+)$"), api_broadcast_delete),
     ("POST", re.compile(r"^/api/system/open$"), api_open),
     ("GET", re.compile(r"^/api/system/data-dir$"), api_open_data_dir),
     ("GET", re.compile(r"^/api/system/download$"), api_download),
@@ -1191,9 +1277,10 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_month_delete_entry,
              api_month_export,
              api_set_platform_status,
-             api_create_project, api_import_run, api_import_path,
+             api_create_project, api_update_project, api_import_run, api_import_path,
              api_notifications, api_notifications_read, api_notifications_clear,
              api_audits, api_audit_done,
+             api_broadcasts, api_broadcast_create, api_broadcast_delete,
              api_worklogs_list, api_worklog_create, api_worklog_update,
              api_worklog_delete, api_worklog_summary}
 
@@ -1272,6 +1359,9 @@ ADMIN_KEY_SET = {
     ("/api/settings", "GET"), ("/api/settings", "PUT"),
     ("/api/system/info", "GET"),
     ("/api/system/open", "POST"), ("/api/system/data-dir", "GET"),
+    # 全服通告：发布 / 查看已发布 / 撤回，都只给管理员
+    ("/api/broadcasts", "GET"), ("/api/broadcasts", "POST"),
+    ("/api/broadcasts/*", "DELETE"),
 }
 
 

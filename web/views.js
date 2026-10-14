@@ -1563,6 +1563,176 @@ async function exportMonth(month) {
 }
 
 /* ==================================================================== 用户管理 */
+/* ------------------------------------------------ 全服通告（管理员） */
+/* 管理员发布公告（例如「月末了，请及时填写月末统计」），可多选接收平台：
+   命中的普通账户在消息中心收到，并（默认）登录后弹「流光横幅」。
+   平台留空 = 全体成员（含运营 / 设计）。已发布的通告可撤回。 */
+VIEWS.notice = async (root) => {
+  if (!isAdmin()) { root.innerHTML = `<div class="empty"><p>需要管理员权限</p></div>`; return; }
+  await loadNoticePage(root);
+};
+
+function bcChipList(data) {
+  const plats = data.platforms || [];
+  const chips = [{ key: "", label: "全体成员", count: data.total || 0 }];
+  plats.forEach((p) => chips.push({
+    key: p.key,
+    label: p.label + (p.readonly ? "（只读）" : ""),
+    count: p.count || 0,
+  }));
+  return chips;
+}
+
+function bcAudienceHtml(chips, selected) {
+  const pick = selected.size
+    ? chips.filter((c) => selected.has(c.key))
+    : chips.filter((c) => !c.key);
+  const n = pick.reduce((s, c) => s + (c.count || 0), 0);
+  const who = pick.length ? pick.map((c) => c.label).join("、") : "全体成员";
+  return `将发送给 <b>${n}</b> 名成员 · ${esc(who)}`
+    + (n === 0 ? ' <span style="color:var(--red)">（该平台当前没有在用账号）</span>' : "");
+}
+
+function bcItemHtml(it) {
+  const aud = it.audience || 0;
+  const rd = it.read_count || 0;
+  const full = aud > 0 && rd >= aud;
+  return `<div class="bc-item" data-bid="${it.id}">
+    <div class="bc-item-main">
+      <div class="bc-item-title">${esc(it.title)}</div>
+      ${it.body ? `<div class="bc-item-body">${esc(it.body)}</div>` : ""}
+      <div class="bc-item-meta">
+        <span class="bc-to">接收：${esc(it.target_platform_label || "全体成员")}</span>
+        <span class="bc-rate${full ? " ok" : ""}">已读 ${rd}/${aud}</span>
+        ${it.popup ? '<span class="bc-rate">弹窗提醒</span>' : '<span class="bc-rate">仅消息中心</span>'}
+        <span>${esc(notifTime(it.created_at))}</span>
+      </div>
+    </div>
+    <div style="flex-shrink:0">
+      <button class="btn btn-danger btn-sm" data-bc-del="${it.id}">撤回</button>
+    </div>
+  </div>`;
+}
+
+async function loadNoticePage(root) {
+  let data;
+  try { data = (await api("/api/broadcasts")).data; }
+  catch (e) { root.innerHTML = `<div class="empty"><p>${esc(e.message)}</p></div>`; return; }
+  const items = data.items || [];
+  const chips = bcChipList(data);
+  const selected = new Set();                     // 空集合 = 全体成员
+
+  root.innerHTML = `
+    <div class="bc-grid">
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head">
+          <h3>📢 发布全服通告</h3>
+          <span class="bc-hint">发布后勾选平台的成员会立刻收到</span>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label>标题</label>
+            <input class="input" id="bcTitle" maxlength="60"
+              placeholder="例如：请及时填写 10 月月末统计">
+          </div>
+          <div class="field" style="margin-top:14px">
+            <label>正文（可选）</label>
+            <textarea class="textarea" id="bcBody" maxlength="600"
+              placeholder="补充说明，例如：截止到本月 28 日，请在「月末项目统计」里填完本月完成的项目编号。"></textarea>
+          </div>
+          <div class="field" style="margin-top:16px">
+            <label>接收平台</label>
+            <div class="bc-chips" id="bcChips">
+              ${chips.map((c) => `
+                <button type="button" class="bc-chip${c.key ? "" : " all on"}"
+                        data-bc-plat="${esc(c.key)}">${esc(c.label)}<b>${c.count}</b></button>`).join("")}
+            </div>
+            <div class="bc-aud" id="bcAud">${bcAudienceHtml(chips, selected)}</div>
+          </div>
+          <label class="bc-check">
+            <input type="checkbox" id="bcPopup" checked>
+            <span><b>登录后弹窗提醒</b>：接收者登录（或正开着页面）时会弹出提醒横幅，
+              直到他点开看过为止。不勾选则只进消息中心。</span>
+          </label>
+          <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
+            <button class="btn btn-primary" id="bcSend">发布通告</button>
+            <button class="btn btn-ghost" id="bcTpl">填入「月末统计提醒」模板</button>
+          </div>
+          <div class="bc-tip">
+            发布平台留空 = 全体成员（含运营 / 设计等只读岗位）；
+            通告发出后管理员自己的消息中心不会出现这条（它是发给成员干活的）。
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head"><h3>已发布通告（${items.length}）</h3>
+          <span class="bc-hint">按发布时间倒序</span>
+        </div>
+        <div class="card-body tight" id="bcList">
+          ${items.length ? items.map(bcItemHtml).join("")
+            : '<div class="notif-empty">还没有发布过通告</div>'}
+        </div>
+      </div>
+    </div>`;
+
+  // 平台 chip：多选；点「全体成员」会清掉其它选择（反之亦然）
+  // ⚠️ selected 为空 = 全体成员，所以「全体」chip 的高亮条件是「没有任何平台被选」，
+  //    不能只看 selected.has("")——那样点完全体反而一个都不亮。
+  const chipEls = $$("[data-bc-plat]", root);
+  const syncChips = () => {
+    chipEls.forEach((el) => {
+      const key = el.dataset.bcPlat;
+      el.classList.toggle("on", key ? selected.has(key) : selected.size === 0);
+    });
+    $("#bcAud").innerHTML = bcAudienceHtml(chips, selected);
+  };
+  chipEls.forEach((el) => el.addEventListener("click", () => {
+    const key = el.dataset.bcPlat;
+    if (!key) { selected.clear(); syncChips(); return; }
+    if (selected.has(key)) selected.delete(key); else selected.add(key);
+    syncChips();
+  }));
+
+  $("#bcTpl").addEventListener("click", () => {
+    const t = $("#bcTitle"), b = $("#bcBody");
+    if (!t.value.trim()) t.value = "请及时填写本月月末统计";
+    if (!b.value.trim()) {
+      b.value = "月末已到，请各位及时到「月末项目统计」页填写本月完成（勾 ✅）的项目编号，"
+        + "填完记得核对一遍，谢谢配合。";
+    }
+    t.focus();
+  });
+
+  $("#bcSend").addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget;
+    const title = $("#bcTitle").value.trim();
+    if (!title) { toast("请填写通告标题", "error"); $("#bcTitle").focus(); return; }
+    const payload = {
+      title,
+      body: $("#bcBody").value.trim(),
+      platforms: Array.from(selected),
+      popup: !!$("#bcPopup").checked,
+    };
+    btn.disabled = true;
+    let res;
+    try { res = (await api("/api/broadcasts", { method: "POST", body: payload })).data; }
+    catch (e) { btn.disabled = false; return toast(e.message, "error"); }
+    toast(`已发布，${res.audience || 0} 名成员会收到提醒`);
+    await loadNoticePage(root);
+  });
+
+  $$("[data-bc-del]", root).forEach((b) => b.addEventListener("click", async () => {
+    const bid = Number(b.dataset.bcDel);
+    if (!confirm("确定撤回这条通告？\n\n撤回后所有接收者的消息中心里这条会消失，"
+      + "已读记录一并清除（此操作不可恢复）。")) return;
+    b.disabled = true;
+    try { await api("/api/broadcasts/" + bid, { method: "DELETE" }); }
+    catch (e) { b.disabled = false; return toast(e.message, "error"); }
+    toast("通告已撤回");
+    await loadNoticePage(root);
+  }));
+}
+
 VIEWS.users = async (root) => {
   if (!isAdmin()) { root.innerHTML = `<div class="empty"><p>需要管理员权限</p></div>`; return; }
   let users;
@@ -1579,7 +1749,8 @@ VIEWS.users = async (root) => {
         <b>普通用户</b>只能填写自己所属平台的板块（运营/设计为只读）。
         「<b>开启审核</b>」给某个普通账号加上<b>审核功能</b>：项目结项后他会收到弹窗提醒，
         复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。
-        自助注册只能创建普通用户，管理员账号请在此处新增。</div>
+        ⚠️ 通知里显示的是账号的<b>「姓名」</b>，不是登录用户名；没填姓名的账号会被写成「账号 xxx」，
+        建议都补上。自助注册只能创建普通用户，管理员账号请在此处新增。</div>
     </div>
     <div class="card">
       <div class="card-head"><h3>账号列表（${users.length}）</h3>
@@ -1598,9 +1769,12 @@ VIEWS.users = async (root) => {
             ${users.map((u) => {
               const isBuiltin = u.username === "admin";
               const lastActiveAdmin = u.role === "admin" && u.active && adminCount <= 1;
+              const noName = noNameOf(u);
               return `<tr data-uid="${u.id}">
               <td><span class="code-cell">${esc(u.username)}</span>${isBuiltin ? ' <span class="pill" style="font-size:10px">内置</span>' : ""}</td>
-              <td>${esc(u.display_name)}</td>
+              <td>${noName ? `<span style="color:var(--text3)">${esc(u.username)}</span>
+                  <span class="pill warn" style="font-size:10px" title="该账号没单独填姓名，通知里会显示成「账号 ${esc(u.username)}」；点「编辑」补上姓名即可">未填姓名</span>`
+                : esc(u.display_name)}</td>
               <td>${u.role === "admin"
                 ? '<span class="pill admin">管理员</span>'
                 : '<span class="pill">普通用户</span>'}</td>
@@ -1632,7 +1806,7 @@ VIEWS.users = async (root) => {
     const uid = b.dataset.auditUser;
     const on = b.dataset.on === "1";
     const u = users.find((x) => String(x.id) === String(uid)) || {};
-    if (!on && !confirm(`给「${u.display_name || u.username}」开启审核功能？\n\n`
+    if (!on && !confirm(`给「${personLabel(u)}」开启审核功能？\n\n`
       + `开启后，项目结项时该账号会收到「请审核」弹窗提醒，\n`
       + `复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。`)) return;
     try {
@@ -1710,8 +1884,8 @@ function newUserDialog() {
         <div>可创建<b>普通用户</b>（需选岗位）或<b>管理员</b>（拥有全部权限）。</div></div>
       <div class="field"><label>用户名</label>
         <input class="input" id="u_name" placeholder="至少 3 个字符"></div>
-      <div class="field" style="margin-top:12px"><label>姓名 / 昵称</label>
-        <input class="input" id="u_display" placeholder="可不填"></div>
+      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知里显示这个，建议必填）</span></label>
+        <input class="input" id="u_display" placeholder="如：张小凡；留空则通知里显示「账号 + 登录名」"></div>
       <div class="field" style="margin-top:12px"><label>初始密码</label>
         <input class="input" id="u_pwd" placeholder="至少 6 位"></div>
       ${rolePlatformFields("user", "cell", false)}`,
@@ -1749,8 +1923,9 @@ function editUserDialog(u, isSelf) {
         <div>这是你当前登录的账号，请勿把自己降级为普通用户或停用，以免失去管理员权限。</div></div>` : ""}
       <div class="field"><label>用户名</label>
         <input class="input" value="${esc(u.username)}" disabled></div>
-      <div class="field" style="margin-top:12px"><label>姓名 / 昵称</label>
-        <input class="input" id="e_display" value="${esc(u.display_name)}"></div>
+      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知 / 审核记录里显示这个）</span></label>
+        <input class="input" id="e_display" value="${noNameOf(u) ? "" : esc(u.display_name)}"
+          placeholder="如：张小凡；留空则通知里显示「账号 + 登录名」"></div>
       ${rolePlatformFields(u.role, u.platform, !!u.can_audit)}`,
     footer: `<span style="flex:1"></span>
       <button class="btn btn-ghost" data-close>取消</button>

@@ -202,11 +202,18 @@ CREATE INDEX IF NOT EXISTS ix_worklogs_user_date ON worklogs(user_id, log_date);
 -- 站内通知（消息中心）：按「角色」广播，已读状态按用户存。
 --   target_role='user'   → 发给所有普通账户（管理员新增项目入库时）
 --   target_role='admin'  → 发给所有管理员（实验员勾选平台完成 / 项目结项时）
+--   target_platform      → 按平台再收窄一层受众（**仅全服通告用**，见下）
 --   popup=1 → 目标用户登录后弹「闪烁流光横幅」；popup=0 → 只在消息中心显示未读。
+-- 受众 = target_role 命中的角色 **且** 平台命中 target_platform：
+--   ''            → 不限制平台（对所有普通账户可见，历史通知都是这个值）
+--   'cell,mol'    → 只有 cell / mol 平台的用户可见（逗号分隔，多选）
+--   ⚠️ 管理员 platform 为空，所以按平台定向的通告管理员自己看不到 —— 这是刻意的：
+--      通告是发给实验员干活的，管理员通过「全服通告」页面查看已发记录即可。
 CREATE TABLE IF NOT EXISTS notifications(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   category TEXT NOT NULL,                 -- project_in 项目入库 / platform_done 平台完成 / project_done 项目结项
   target_role TEXT NOT NULL DEFAULT 'user',
+  target_platform TEXT DEFAULT '',        -- 受众平台（逗号分隔，'' = 不限平台）；全服通告用
   title TEXT NOT NULL DEFAULT '',         -- 主文案（消息中心与横幅都用它）
   body TEXT DEFAULT '',                   -- 详情（编号清单等）
   ptype TEXT DEFAULT '',                  -- 关联项目类型
@@ -304,6 +311,7 @@ def _migrate(conn) -> None:
        所以必须换掉；存量数据 seq 默认 0，组内本来就只有一行，迁移后依然唯一。
     ② 补 users.can_audit 列（审核权限，2026-10-14 新增）。
     ③ 补 notification_reads.hidden 列（「清空消息中心」按人隐藏，2026-10-14 新增）。
+    ④ 补 notifications.target_platform 列（全服通告按平台定向，2026-10-14 新增）。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     if "seq" not in cols:
@@ -320,6 +328,9 @@ def _migrate(conn) -> None:
     ncols = {r["name"] for r in conn.execute("PRAGMA table_info(notification_reads)")}
     if ncols and "hidden" not in ncols:
         conn.execute("ALTER TABLE notification_reads ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+    tcols = {r["name"] for r in conn.execute("PRAGMA table_info(notifications)")}
+    if tcols and "target_platform" not in tcols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN target_platform TEXT DEFAULT ''")
 
 
 def init_db() -> None:
@@ -1307,16 +1318,55 @@ NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成
 NOTIF_PROJECT_DONE = "project_done"    # 项目结项（待审核）
 NOTIF_AUDIT_REQUEST = "audit_request"  # 结项待审核（发给有审核权限的普通账户）
 NOTIF_AUDIT_DONE = "audit_done"        # 审核完成（发给管理员）
+NOTIF_BROADCAST = "broadcast"          # 全服通告（管理员手动发布，可按平台定向）
 NOTIF_CATEGORY_NAME = {
     NOTIF_PROJECT_IN: "项目入库",
     NOTIF_PLATFORM_DONE: "平台完成",
     NOTIF_PROJECT_DONE: "项目结项",
     NOTIF_AUDIT_REQUEST: "待审核",
     NOTIF_AUDIT_DONE: "审核完成",
+    NOTIF_BROADCAST: "全服通告",
 }
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
 ROLE_AUDITOR = "auditor"   # 不是真实角色，只是「审核员」这一受众标签
+
+# 平台多选上限：四条实验线 + 运营 / 设计（全服通告可选「全体成员」= 传空列表）
+BROADCAST_PLATFORM_KEYS = list(PLATFORM_KEYS) + ["ops", "design"]
+
+
+def norm_target_platform(platforms) -> str:
+    """把前端传来的平台列表归一成逗号分隔串（去重、按 SIGNUP_OPTIONS 顺序、非法值丢弃）。
+
+    [] / None / 含未知键 → 返回 ""（= 不限平台，对全体普通账户可见）。
+    """
+    if not platforms:
+        return ""
+    if isinstance(platforms, str):
+        platforms = [p for p in platforms.replace("，", ",").split(",")]
+    picked = {str(p or "").strip().lower() for p in platforms}
+    out = [k for k in BROADCAST_PLATFORM_KEYS if k in picked]
+    if not out or len(out) == len(BROADCAST_PLATFORM_KEYS):
+        return ""                      # 全选 = 不限平台（等价于「全体成员」）
+    return ",".join(out)
+
+
+def target_platform_label(target_platform) -> str:
+    """逗号串 → 「细胞、分子」；空串 → 全体成员。"""
+    keys = [k for k in str(target_platform or "").split(",") if k]
+    if not keys:
+        return "全体成员"
+    return "、".join(SIGNUP_LABEL.get(k, k) for k in keys)
+
+
+def _plat_where(alias: str, platform: str) -> str:
+    """受众平台过滤 SQL 片段（作用在 notifications.target_platform 上）。"""
+    return (f"(COALESCE({alias}.target_platform,'')='' "
+            f"OR INSTR(','||{alias}.target_platform||',', ?)>0)")
+
+
+def _plat_arg(platform: str) -> str:
+    return f",{platform or ''},"
 
 
 def _notif_public(row: dict, read: bool = False) -> dict:
@@ -1331,6 +1381,8 @@ def _notif_public(row: dict, read: bool = False) -> dict:
         "code": row.get("code") or "",
         "platform": row.get("platform") or "",
         "platform_label": PLATFORM_LABEL.get(row.get("platform"), row.get("platform") or ""),
+        "target_platform": row.get("target_platform") or "",
+        "target_platform_label": target_platform_label(row.get("target_platform")),
         "project_id": int(row.get("project_id") or 0),
         "popup": bool(row.get("popup")),
         "created_at": row.get("created_at") or "",
@@ -1338,11 +1390,18 @@ def _notif_public(row: dict, read: bool = False) -> dict:
         # 仅「待审核」类消息会填：对应 project_audits 的 id 与当前状态
         "audit_id": 0,
         "audit_pending": False,
+        # sticky = 「粘住不放」：项目还没审核完成时，这条提醒永远按未读渲染、角标也照常计数
+        "sticky": False,
     }
 
 
 def _annotate_audits(items: list) -> list:
-    """给「待审核」消息补上 audit_id / audit_pending，前端据此决定要不要出「审核完成」按钮。"""
+    """给「待审核」消息补上 audit_id / audit_pending / sticky。
+
+    ★ sticky（待审核项目的「请审核」提醒）：点过、点过全部已读、清空过都不算数，
+    前端仍按未读渲染，角标也继续计数 —— 只有点「审核完成」才取消。
+    目的：消息多的时候不遗漏待审核项目。
+    """
     keys = {(x["ptype"], x["code"]) for x in items if x.get("category") == NOTIF_AUDIT_REQUEST}
     if not keys:
         return items
@@ -1354,6 +1413,7 @@ def _annotate_audits(items: list) -> list:
         if a:
             x["audit_id"] = a["id"]
             x["audit_pending"] = a["status"] == "pending"
+            x["sticky"] = bool(x["audit_pending"])
             if a.get("auditor_name"):
                 x["audit_auditor"] = a["auditor_name"]
     return items
@@ -1362,14 +1422,18 @@ def _annotate_audits(items: list) -> list:
 def add_notification(category: str, target_role: str, title: str, body: str = "",
                      ptype: str = "", code: str = "", platform: str = "",
                      project_id: int = 0, popup: bool = False,
-                     created_by: int = 0) -> int:
-    """写一条通知，返回 id。target_role = 'user'（全员普通账户）/ 'admin'（全员管理员）。"""
+                     created_by: int = 0, target_platform: str = "") -> int:
+    """写一条通知，返回 id。target_role = 'user'（全员普通账户）/ 'admin'（全员管理员）。
+
+    target_platform 非空时再按平台收窄受众（逗号分隔，见 SCHEMA 里的说明）。
+    """
     with tx() as conn:
         cur = conn.execute(
-            "INSERT INTO notifications(category,target_role,title,body,ptype,code,"
-            "platform,project_id,popup,created_by,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (category, target_role, (title or "").strip(), (body or "").strip(),
+            "INSERT INTO notifications(category,target_role,target_platform,title,body,"
+            "ptype,code,platform,project_id,popup,created_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (category, target_role, str(target_platform or ""), (title or "").strip(),
+             (body or "").strip(),
              ptype or "", str(code or ""), platform or "", int(project_id or 0),
              1 if popup else 0, int(created_by or 0), _now()))
         return cur.lastrowid
@@ -1384,10 +1448,11 @@ def add_notifications_bulk(rows: list) -> int:
     with tx() as conn:
         for r in rows:
             conn.execute(
-                "INSERT INTO notifications(category,target_role,title,body,ptype,code,"
-                "platform,project_id,popup,created_by,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO notifications(category,target_role,target_platform,title,body,"
+                "ptype,code,platform,project_id,popup,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.get("category") or "", r.get("target_role") or ROLE_USER,
+                 str(r.get("target_platform") or ""),
                  str(r.get("title") or "").strip(), str(r.get("body") or "").strip(),
                  r.get("ptype") or "", str(r.get("code") or ""), r.get("platform") or "",
                  int(r.get("project_id") or 0), 1 if r.get("popup") else 0,
@@ -1397,6 +1462,21 @@ def add_notifications_bulk(rows: list) -> int:
 
 def _role_of(user) -> str:
     return ROLE_ADMIN if (user or {}).get("role") == ROLE_ADMIN else ROLE_USER
+
+
+def person_label(user) -> str:
+    """通知 / 审核记录里显示「这个人是谁」。
+
+    优先账号的**姓名**（display_name）；如果这个账号压根没单独填姓名
+    （注册 / 建号时留空，存储层会把姓名兜底成登录名），就明写成「账号 xxx」，
+    不把登录名当成人名显示 —— 用户看到的应该是一个人的姓名，而不是登录账号。
+    """
+    user = user or {}
+    name = str(user.get("display_name") or "").strip()
+    uname = str(user.get("username") or "").strip()
+    if name and name != uname:
+        return name
+    return f"账号 {uname}" if uname else "审核员"
 
 
 def roles_for(user) -> list:
@@ -1414,16 +1494,19 @@ def roles_for(user) -> list:
 
 
 def list_notifications(user_id: int, roles, limit: int = 200,
-                       unread_only: bool = False, popup_only: bool = False) -> list:
-    """当前用户可见的通知（按受众标签 + 自己的已读状态）。倒序。
+                       unread_only: bool = False, popup_only: bool = False,
+                       platform: str = "") -> list:
+    """当前用户可见的通知（按受众标签 + 平台 + 自己的已读状态）。倒序。
 
     roles 可以是单个字符串（兼容旧调用）或列表。
+    platform = 当前用户的岗位；只有「不限平台」或**明确包含该平台**的通告才可见。
     """
     if isinstance(roles, str):
         roles = [roles]
     roles = [r for r in (roles or []) if r] or [ROLE_USER]
-    where = [f"n.target_role IN ({','.join('?' * len(roles))})"]
-    args = list(roles)
+    where = [f"n.target_role IN ({','.join('?' * len(roles))})",
+             _plat_where("n", platform)]
+    args = list(roles) + [_plat_arg(platform)]
     if unread_only:
         where.append("r.notification_id IS NULL")
     if popup_only:
@@ -1440,27 +1523,59 @@ def list_notifications(user_id: int, roles, limit: int = 200,
         [_notif_public(dict(r), read=r["read_at"] is not None) for r in rows])
 
 
-def notif_unread_count(user_id: int, roles) -> int:
+def _sticky_audit_cond(alias: str) -> str:
+    """「待审核提醒恒算未读」的 SQL 条件（alias = notifications 表别名）。
+
+    条件成立 ⇔ 这条是 audit_request，且它对应的 project_audits 还是 pending。
+    用在未读计数里，让红点一直亮到「审核完成」为止。
+    """
+    return (f"({alias}.category=? AND EXISTS(SELECT 1 FROM project_audits a "
+            f"WHERE a.status='pending' AND a.ptype={alias}.ptype "
+            f"AND UPPER(a.code)=UPPER({alias}.code)))")
+
+
+def notif_unread_count(user_id: int, roles, platform: str = "",
+                       can_audit: bool = False) -> int:
+    """角标红点数量。
+
+    ★ 审核员的「请审核」提醒**恒算未读**：只要项目还是 pending，这条消息无论
+    点过、点过「全部已读」、还是清空过消息中心（见 hide_notifications），角标都不消，
+    只有点「审核完成」把 project_audits 置成 done 才归零。消息多时不遗漏待审核项目。
+    ★ can_audit 时再补上「压根没有提醒消息」的 pending 项目（例如结项那会儿还没有
+    审核员，后来才被授予审核权限），否则红点不会亮、工作台里的待办就容易被忘掉。
+    """
     if isinstance(roles, str):
         roles = [roles]
     roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    ph = ",".join("?" * len(roles))
     with tx() as conn:
-        return conn.execute(
+        n = conn.execute(
             f"SELECT COUNT(*) n FROM notifications n "
             f"LEFT JOIN notification_reads r "
             f"  ON r.notification_id=n.id AND r.user_id=? "
-            f"WHERE n.target_role IN ({','.join('?' * len(roles))}) "
-            f"  AND r.notification_id IS NULL",
-            [user_id] + roles).fetchone()["n"]
+            f"WHERE n.target_role IN ({ph}) "
+            f"  AND {_plat_where('n', platform)} "
+            f"  AND (r.notification_id IS NULL OR {_sticky_audit_cond('n')})",
+            [user_id] + roles + [_plat_arg(platform), NOTIF_AUDIT_REQUEST]).fetchone()["n"]
+        if not can_audit:
+            return n
+        miss = conn.execute(
+            f"SELECT COUNT(*) n FROM project_audits a WHERE a.status='pending' "
+            f"AND NOT EXISTS (SELECT 1 FROM notifications n "
+            f"  WHERE n.category=? AND n.ptype=a.ptype AND UPPER(n.code)=UPPER(a.code) "
+            f"  AND n.target_role IN ({ph}) AND {_plat_where('n', platform)})",
+            [NOTIF_AUDIT_REQUEST] + roles + [_plat_arg(platform)]).fetchone()["n"]
+    return int(n) + int(miss)
 
-def notif_pending_popups(user_id: int, roles, limit: int = 20) -> list:
+def notif_pending_popups(user_id: int, roles, limit: int = 20,
+                        platform: str = "") -> list:
     """需要弹横幅的未读通知（popup=1）。用户标记已读后就不再返回。
 
     ⚠️「已复核完成」的待审核提醒不再弹：那条 audit_request 只是历史记录，
     再打断审核员毫无意义（列表里仍能看到，状态是 ✅ 已审核）。
     """
     rows = list_notifications(user_id, roles, limit=limit,
-                              unread_only=True, popup_only=True)
+                              unread_only=True, popup_only=True, platform=platform)
     return [x for x in rows
             if not (x.get("category") == NOTIF_AUDIT_REQUEST and x.get("audit_id")
                     and not x.get("audit_pending"))]
@@ -1487,11 +1602,14 @@ def mark_notif_read_for_project(user_id: int, category: str, ptype: str,
     return len(rows)
 
 
-def mark_notifications_read(user_id: int, ids=None, roles=None) -> int:
+def mark_notifications_read(user_id: int, ids=None, roles=None,
+                            platform: str = "") -> int:
     """标记已读。ids=None 表示「全部已读」，否则只标记给定 id（且必须是自己角色可见的）。
 
     ⚠️ 全部已读必须按 roles 过滤：审核员还有 target_role='auditor' 的「待审核」消息，
     早期写死 IN ('user','admin') 会让审核员点「全部已读」后那批仍是未读。
+    ⚠️ 同时按 platform 过滤，免得把「发给自己平台以外」的通告也写了已读记录
+    （万一以后换岗位，那些通告会诡异地显示成已读）。
     """
     ids = [int(i) for i in (ids or [])] if ids is not None else None
     if isinstance(roles, str):
@@ -1502,7 +1620,8 @@ def mark_notifications_read(user_id: int, ids=None, roles=None) -> int:
         if ids is None:
             rows = conn.execute(
                 f"SELECT id FROM notifications WHERE target_role IN "
-                f"({','.join('?' * len(roles))})", roles).fetchall()
+                f"({','.join('?' * len(roles))}) AND {_plat_where('notifications', platform)}",
+                roles + [_plat_arg(platform)]).fetchall()
         else:
             if not ids:
                 return 0
@@ -1520,12 +1639,14 @@ def mark_notifications_read(user_id: int, ids=None, roles=None) -> int:
     return n
 
 
-def hide_notifications(user_id: int, roles) -> int:
+def hide_notifications(user_id: int, roles, platform: str = "") -> int:
     """清空「我」的消息中心：把当前用户可见的通知全部标记为已读 + 隐藏。
 
     通知是按受众标签广播的（没有 per-user 行），所以「清空」只能按人隐藏：
     给当前用户写一条 hidden=1 的已读记录。别人的消息中心完全不受影响，
     「待我审核」这类独立工作台也不受影响。
+    ★ 例外：**待审核项目的「请审核」提醒清不掉** —— 项目还没审核完成，
+    红点与那条消息都必须留着，否则「清空一下」就把待办藏起来了。
     """
     if isinstance(roles, str):
         roles = [roles]
@@ -1534,7 +1655,9 @@ def hide_notifications(user_id: int, roles) -> int:
     with tx() as conn:
         rows = conn.execute(
             f"SELECT id FROM notifications WHERE target_role IN "
-            f"({','.join('?' * len(roles))})", roles).fetchall()
+            f"({','.join('?' * len(roles))}) AND {_plat_where('notifications', platform)} "
+            f"AND NOT {_sticky_audit_cond('notifications')}",
+            roles + [_plat_arg(platform), NOTIF_AUDIT_REQUEST]).fetchall()
         for r in rows:
             conn.execute(
                 "INSERT INTO notification_reads(notification_id,user_id,read_at,hidden) "
@@ -1551,6 +1674,96 @@ def clear_notifications() -> int:
         conn.execute("DELETE FROM notifications")
         conn.execute("DELETE FROM notification_reads")
     return n
+
+
+# ================================================================== 全服通告
+# 管理员手动发布的公告（如「月末了，请及时填写月末统计」），可选定接收平台；
+# 命中平台的普通账户会在消息中心收到，并按 popup 决定要不要弹横幅。
+def platform_member_counts() -> dict:
+    """各岗位在用的普通账户数（{'cell':3,..., '__total__':9}）。"""
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT platform, COUNT(*) n FROM users WHERE role=? AND active=1 "
+            "GROUP BY platform", (ROLE_USER,)).fetchall()
+    out = {k: 0 for k in BROADCAST_PLATFORM_KEYS}
+    out["__total__"] = 0
+    for r in rows:
+        n = int(r["n"] or 0)
+        out["__total__"] += n
+        out[str(r["platform"] or "")] = n
+    return out
+
+
+def broadcast_audience(target_platform, counts: dict = None) -> int:
+    """某条通告的受众规模（人）。target_platform 为空 = 全体普通账户。"""
+    counts = counts if counts is not None else platform_member_counts()
+    keys = [k for k in str(target_platform or "").split(",") if k]
+    if not keys:
+        return int(counts.get("__total__") or 0)
+    return sum(int(counts.get(k) or 0) for k in keys)
+
+
+def get_notification(nid: int):
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM notifications WHERE id=?",
+                           (int(nid or 0),)).fetchone()
+    return _notif_public(dict(row)) if row else None
+
+
+def add_broadcast(title: str, body: str, platforms, popup: bool = True,
+                  created_by: int = 0) -> dict:
+    """发布一条全服通告，返回该记录（含受众标签）。
+
+    platforms = 平台键列表；空 / 全选 → 不限平台（全体普通账户可见）。
+    """
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("通告标题不能为空")
+    tp = norm_target_platform(platforms)
+    nid = add_notification(NOTIF_BROADCAST, ROLE_USER, title, body,
+                           popup=bool(popup), created_by=int(created_by or 0),
+                           target_platform=tp)
+    item = get_notification(nid) or {}
+    item["audience"] = broadcast_audience(tp)
+    item["read_count"] = 0
+    return item
+
+
+def list_broadcasts(limit: int = 100) -> list:
+    """已发布通告列表（倒序），带「受众人数 / 已读人数」统计。"""
+    counts = platform_member_counts()
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE category=? ORDER BY id DESC LIMIT ?",
+            (NOTIF_BROADCAST, int(limit or 100))).fetchall()
+        out = []
+        for r in rows:
+            d = _notif_public(dict(r))
+            keys = [k for k in str(d["target_platform"]).split(",") if k]
+            sql = ("SELECT COUNT(*) n FROM notification_reads rd "
+                   "JOIN users u ON u.id=rd.user_id "
+                   "WHERE rd.notification_id=? AND rd.read_at IS NOT NULL "
+                   "  AND u.role=? AND u.active=1")
+            args = [d["id"], ROLE_USER]
+            if keys:
+                sql += f" AND u.platform IN ({','.join('?' * len(keys))})"
+                args += keys
+            d["read_count"] = int(conn.execute(sql, args).fetchone()["n"] or 0)
+            d["audience"] = broadcast_audience(d["target_platform"], counts)
+            out.append(d)
+    return out
+
+
+def delete_broadcast(bid: int) -> bool:
+    """撤回通告：连同已读记录一起删掉（广播类没有 per-user 行，直接删干净）。"""
+    bid = int(bid or 0)
+    with tx() as conn:
+        row = conn.execute("SELECT category FROM notifications WHERE id=?", (bid,)).fetchone()
+        if not row or (row["category"] or "") != NOTIF_BROADCAST:
+            return False
+        conn.execute("DELETE FROM notification_reads WHERE notification_id=?", (bid,))
+        conn.execute("DELETE FROM notifications WHERE id=?", (bid,))
+    return True
 
 
 # ================================================================== 结项审核
@@ -1630,7 +1843,11 @@ def count_audits(status: str = "pending") -> int:
 
 
 def complete_audit(aid: int, auditor: dict):
-    """审核员复核完成：标记 done 并记下审核人。已审核过则返回 None（避免重复通知）。"""
+    """审核员复核完成：标记 done 并记下审核人。已审核过则返回 None（避免重复通知）。
+
+    ⚠️ auditor_name 存的是**姓名**（见 person_label）；账号没填姓名时存「账号 xxx」，
+    不存登录名 —— 消息中心里显示的是「✅ 已审核（某某某）」。
+    """
     auditor = auditor or {}
     with tx() as conn:
         row = conn.execute("SELECT * FROM project_audits WHERE id=?", (int(aid or 0),)).fetchone()
@@ -1642,7 +1859,7 @@ def complete_audit(aid: int, auditor: dict):
         conn.execute(
             "UPDATE project_audits SET status='done', auditor_id=?, auditor_name=?, reviewed_at=? "
             "WHERE id=?",
-            (int(auditor.get("id") or 0), auditor.get("display_name") or auditor.get("username") or "",
+            (int(auditor.get("id") or 0), person_label(auditor),
              _now(), row["id"]))
         new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (row["id"],)).fetchone())
     return _audit_public(new)

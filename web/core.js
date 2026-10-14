@@ -55,6 +55,24 @@ function maskFile(name) {
 
 /* ------------------------------------------------ 权限 */
 function isAdmin() { return !!state.me && state.me.role === "admin"; }
+
+/* 账号人名口径（与后端 db.person_label 一致）：
+   通知 / 审核记录里显示的是**姓名**；账号没单独填姓名时写成「账号 xxx」，
+   不把登录名当人名显示。 */
+function personLabel(u) {
+  u = u || {};
+  const name = String(u.display_name || "").trim();
+  const uname = String(u.username || "").trim();
+  if (name && name !== uname) return name;
+  return uname ? `账号 ${uname}` : "审核员";
+}
+// 该账号是否「没单独填姓名」（空 / 与登录名相同，存储层会把姓名兜底成登录名）
+function noNameOf(u) {
+  u = u || {};
+  const name = String(u.display_name || "").trim();
+  const uname = String(u.username || "").trim();
+  return !name || name === uname;
+}
 function myPlatform() { return (state.me && state.me.platform) || ""; }
 function isReadonly() { return !isAdmin() && !!(state.me && state.me.readonly); }
 function canEditPlatform(p) {
@@ -199,9 +217,9 @@ function alertDialog(title, bodyHtml, okText = "知道了") {
      · 项目入库（普通账户收）：真实/加急/返修 → 登录弹「流光横幅」；库存只进消息中心。
      · 平台完成 / 项目结项（管理员收）：只在消息中心显示未读，不弹窗。 */
 const NOTIF_ICON = { project_in: "📦", platform_done: "✅", project_done: "🏁",
-                     audit_request: "🔎", audit_done: "🛡️" };
+                     audit_request: "🔎", audit_done: "🛡️", broadcast: "📢" };
 const NOTIF_TAG = { project_in: "项目入库", platform_done: "平台完成", project_done: "项目结项",
-                    audit_request: "待审核", audit_done: "审核完成" };
+                    audit_request: "待审核", audit_done: "审核完成", broadcast: "全服通告" };
 
 function notifTime(s) {
   const t = String(s || "");
@@ -243,6 +261,11 @@ function renderNotifBadge() {
   const n = state.notif.unread || 0;
   if (n > 0) { b.hidden = false; b.textContent = n > 99 ? "99+" : String(n); }
   else { b.hidden = true; b.textContent = "0"; }
+  b.title = n > 0
+    ? (state.notif.canAudit && n > 0
+        ? `${n} 条未读（含待审核，点「审核完成」后红点才消）`
+        : `${n} 条未读`)
+    : "";
   if (bell) bell.classList.toggle("has-unread", n > 0);
 }
 
@@ -250,23 +273,30 @@ function notifItemHtml(n) {
   const tag = NOTIF_TAG[n.category] || "";
   const icon = NOTIF_ICON[n.category] || "🔔";
   const isAudit = n.category === "audit_request";
+  // sticky = 待审核项目的「请审核」提醒：点过、点过「全部已读」、清空过都不算数，
+  //   这条永远按未读渲染（右侧红点不灭）、右上角角标也一直计数，
+  //   只有点了「审核完成」才取消 —— 消息多的时候不至于漏掉待审核项目。
+  const unread = !n.read || !!n.sticky;
   const act = isAudit
     ? (n.audit_pending
         ? `<div class="ni-act"><button class="btn btn-green btn-sm" data-audit="${n.audit_id}">审核完成</button>
-             <span class="ni-hint">复核无误后点这里，管理员会收到通知</span></div>`
+             <span class="ni-hint">复核无误后点这里；<b>没点之前红点不会消</b>，以免漏审</span></div>`
         : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`)
     : "";
-  return `<div class="notif-item${n.read ? "" : " unread"}" data-nid="${n.id}"
+  // 全服通告：标出这条是发给哪些平台的（全体成员 / 细胞、分子）
+  const aud = n.category === "broadcast"
+    ? `<span class="ni-plat">接收：${esc(n.target_platform_label || "全体成员")}</span>` : "";
+  return `<div class="notif-item${unread ? " unread" : ""}${n.sticky ? " sticky" : ""}" data-nid="${n.id}"
       ${n.code ? `data-code="${esc(n.code)}"` : ""}
       title="${n.code ? "点击到项目库查看该项目" : ""}">
     <span class="ni-icon">${icon}</span>
     <div class="ni-main">
       <div class="ni-title">${notifTypePill(n.ptype)}${esc(n.title)}</div>
       ${n.body ? `<div class="ni-body">${esc(n.body)}</div>` : ""}
-      <div class="ni-meta">${tag ? `<span class="ni-tag">${esc(tag)}</span>` : ""}<span>${esc(notifTime(n.created_at))}</span></div>
+      <div class="ni-meta">${tag ? `<span class="ni-tag">${esc(tag)}</span>` : ""}${n.sticky ? '<span class="ni-tag ni-lock">待办 · 未审核完成前一直提醒</span>' : ""}${aud}<span>${esc(notifTime(n.created_at))}</span></div>
       ${act}
     </div>
-    ${n.read ? "" : '<span class="ni-dot"></span>'}
+    ${unread ? '<span class="ni-dot"></span>' : ''}
   </div>`;
 }
 
@@ -321,10 +351,10 @@ function renderNotifPanel() {
           : '<div class="notif-empty">暂时没有消息</div>'}
       </div>
       <div class="notif-foot">${isAdmin()
-        ? "实验员把平台勾成 ✅、审核员复核完成后，这里会收到「平台完成 / 项目结项 / 审核完成」提醒。"
+        ? "实验员把平台勾成 ✅、审核员复核完成后，这里会收到「平台完成 / 项目结项 / 审核完成」提醒。要发全服提醒，去左侧「全服通告」。"
         : state.notif.canAudit
-          ? "管理员新增项目后这里会收到「项目已入库」；项目结项后这里会出现「待审核」，复核完点「审核完成」。"
-          : "管理员新增项目后，这里会收到「项目已入库」提醒。"}</div>
+          ? "管理员新增项目后这里会收到「项目已入库」；项目结项后这里会出现「待审核」，复核完点「审核完成」；📢全服通告也会送到这里。待审核项目在点「审核完成」之前，这条消息和右上角红点会一直保留（点过、全部已读、清空都消不掉）。"
+          : "管理员新增项目后，这里会收到「项目已入库」提醒；管理员发布的📢全服通告（发给你所在平台的）也会送到这里。"}</div>
     </div>`;
   bindNotifPanel();
 }
@@ -366,11 +396,12 @@ function bindNotifPanel() {
     try { await api("/api/notifications/read", { method: "POST", body: { all: true } }); }
     catch (e) { return toast(e.message, "error"); }
     (state.notif.items || []).forEach((x) => { x.read = true; });
-    state.notif.unread = 0;
+    const stickyLeft = (state.notif.items || []).filter((x) => x.sticky).length;
     state.notif.popups = [];
-    renderNotifBadge();
-    renderNotifPanel();
-    toast("已全部标记为已读");
+    await loadNotifications({ popup: false });   // 未读数以后端为准：待审核的仍算未读
+    toast(stickyLeft
+      ? `已全部标记为已读；还有 ${stickyLeft} 个待审核项目，点「审核完成」后红点才会消`
+      : "已全部标记为已读");
   });
 
   // 清空：把「我」的消息列表整个清掉（按人隐藏，别人的消息中心不受影响）
@@ -380,6 +411,7 @@ function bindNotifPanel() {
     if (!confirm("确定清空消息中心？\n\n"
       + "· 只清空你自己的消息列表，其他账号的消息不受影响；\n"
       + "· 「待我审核」工作台不受影响，待审核项目仍会列出；\n"
+      + "· 待审核项目的「请审核」提醒清不掉（右上角红点也不会消），点了「审核完成」才消失；\n"
       + "· 清空后这些消息不会再弹横幅。")) return;
     clr.disabled = true;
     try {
@@ -388,13 +420,11 @@ function bindNotifPanel() {
       clr.disabled = false;
       return toast(e.message, "error");
     }
-    state.notif.items = [];
-    state.notif.unread = 0;
     state.notif.popups = [];
-    renderNotifBadge();
     await loadNotifications({ popup: false });
-    if (state.notif.open) renderNotifPanel();
-    toast("消息已清空");
+    const left = (state.notif.items || []).filter((x) => x.sticky).length;
+    toast(left ? `消息已清空；${left} 个待审核项目仍会提醒`
+               : "消息已清空");
   });
 
   panel.querySelectorAll(".notif-item").forEach((el) => el.addEventListener("click", async () => {
@@ -405,7 +435,10 @@ function bindNotifPanel() {
       try { await api("/api/notifications/read", { method: "POST", body: { ids: [nid] } }); }
       catch (e) { /* 标已读失败不影响跳转 */ }
       item.read = true;
-      state.notif.unread = Math.max(0, (state.notif.unread || 0) - 1);
+      // 待审核的提醒是「粘住」的：标已读也照样算未读，别去减角标
+      if (!item.sticky) {
+        state.notif.unread = Math.max(0, (state.notif.unread || 0) - 1);
+      }
       state.notif.popups = (state.notif.popups || []).filter((x) => x.id !== nid);
       renderNotifBadge();
     }
@@ -497,6 +530,7 @@ const ICONS = {
   browse: '<path d="M4 4a2 2 0 0 1 2-2h6l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
   import: '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/>',
   users: '<circle cx="9" cy="8" r="3.2"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 11a3 3 0 1 0 0-6"/><path d="M18 20a6 6 0 0 0-3-5.2"/>',
+  notice: '<path d="M3 11v2a1 1 0 0 0 1 1h2l4 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M14 7.5a5 5 0 0 1 0 9"/><path d="M17.5 5a9 9 0 0 1 0 14"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 13.7H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10.3 3V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9"/>',
 };
 
@@ -508,9 +542,10 @@ function navItems() {
     { key: "browse", label: "项目库" },
     { key: "worklog", label: "工作日志" },
   ];
-  // 仅管理员：导入项目库 / 用户管理 / 设置
+  // 仅管理员：导入项目库 / 全服通告 / 用户管理 / 设置
   if (isAdmin()) {
     items.push({ key: "import", label: "导入项目库" });
+    items.push({ key: "notice", label: "全服通告" });
     items.push({ key: "users", label: "用户管理" });
     items.push({ key: "settings", label: "设置" });
   }
@@ -593,6 +628,7 @@ const TITLES = {
   browse: ["项目库", "浏览与维护全部项目"],
   worklog: ["工作日志", "记录每日工作 · 仅自己可见"],
   import: ["导入项目库", "从 Excel 批量导入 / 更新"],
+  notice: ["全服通告", "按平台定向发布提醒 · 收到的人会弹窗"],
   users: ["用户管理", "账号与平台岗位"],
   settings: ["设置", "导出目录与数据维护"],
 };
