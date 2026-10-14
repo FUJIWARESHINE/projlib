@@ -197,13 +197,15 @@ def import_workbook(path: str, mode: str = "upsert", source_label: str = "") -> 
                 repeat_groups[row["code"]] = repeat_groups.get(row["code"], 0) + 1
             batch.append(dict(row))
     # 单事务批量写入（一次连接/提交，避免逐条 fsync 拖慢到几十秒）
-    created, updated = db.upsert_projects_bulk(batch)
+    created, updated, created_items = db.upsert_projects_bulk(batch)
     db.set_meta("source_file", source_label or path)
     db.set_meta("last_import", __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     return {
         "ok": True,
         "created": created,
         "updated": updated,
+        # 本次**新增**的项目（ptype/code/name），供上层生成「已入库」通知
+        "created_items": created_items,
         # 兼容旧字段名：现在不再丢行，恒为空
         "skipped": {},
         # 同编号+同内容的重复出现（已全部保留），供前端提示

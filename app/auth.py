@@ -132,8 +132,12 @@ def create_admin(username: str, password: str, display_name: str = "") -> dict:
 
 
 def update_user(uid: int, display_name: str = None, platform: str = None,
-                role: str = None, active: bool = None) -> dict:
-    """管理员修改账号信息（显示名 / 岗位 / 角色 / 启用状态）。未传的字段不动。"""
+                role: str = None, active: bool = None, can_audit: bool = None) -> dict:
+    """管理员修改账号信息（显示名 / 岗位 / 角色 / 启用状态 / 审核权限）。未传的字段不动。
+
+    can_audit（拥有审核功能）只对普通用户有意义：项目结项后由这些账号复核，
+    复核完成后系统会给管理员发「某某某已审核完成，请复审」。管理员恒为 0。
+    """
     with db.tx() as conn:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if not row:
@@ -151,6 +155,10 @@ def update_user(uid: int, display_name: str = None, platform: str = None,
             if new_plat not in db.SIGNUP_LABEL:
                 raise ValueError("请选择所属岗位")
         new_active = row.get("active", 1) if active is None else (1 if active else 0)
+        cur_audit = int(row.get("can_audit") or 0)
+        new_audit = cur_audit if can_audit is None else (1 if can_audit else 0)
+        if new_role == ROLE_ADMIN:
+            new_audit = 0                     # 管理员不需要「审核员」身份，本身就能复审
         # 不允许停用最后一个启用中的管理员
         if new_role != ROLE_ADMIN or not new_active:
             admins = conn.execute(
@@ -160,8 +168,8 @@ def update_user(uid: int, display_name: str = None, platform: str = None,
             if losing and admins == 0:
                 raise ValueError("至少保留一个启用中的管理员")
         conn.execute(
-            "UPDATE users SET display_name=?, platform=?, role=?, active=? WHERE id=?",
-            (new_name, new_plat, new_role, new_active, uid))
+            "UPDATE users SET display_name=?, platform=?, role=?, active=?, can_audit=? WHERE id=?",
+            (new_name, new_plat, new_role, new_active, new_audit, uid))
     return get_user(uid)
 
 
@@ -188,6 +196,7 @@ def _public(row: dict) -> dict:
         "platform": plat,
         "platform_name": db.SIGNUP_LABEL.get(plat, "全部平台"),
         "readonly": plat in db.READONLY_PLATFORMS,
+        "can_audit": bool(row.get("can_audit") or 0),
         "active": bool(row.get("active", 1)),
         "created_at": row.get("created_at") or "",
         "last_login": row.get("last_login") or "",

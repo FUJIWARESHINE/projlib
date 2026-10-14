@@ -1577,6 +1577,8 @@ VIEWS.users = async (root) => {
       <span>👥</span>
       <div><b>管理员</b>可管理项目库、导入数据、导出文件，并管理账号；
         <b>普通用户</b>只能填写自己所属平台的板块（运营/设计为只读）。
+        「<b>开启审核</b>」给某个普通账号加上<b>审核功能</b>：项目结项后他会收到弹窗提醒，
+        复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。
         自助注册只能创建普通用户，管理员账号请在此处新增。</div>
     </div>
     <div class="card">
@@ -1588,6 +1590,7 @@ VIEWS.users = async (root) => {
           <thead><tr>
             <th style="width:150px">用户名</th><th style="width:130px">姓名</th>
             <th style="width:110px">角色</th><th style="width:120px">所属平台</th>
+            <th style="width:130px">审核功能</th>
             <th style="width:90px">状态</th><th style="width:150px">上次登录</th>
             <th style="width:230px">操作</th>
           </tr></thead>
@@ -1602,6 +1605,12 @@ VIEWS.users = async (root) => {
                 ? '<span class="pill admin">管理员</span>'
                 : '<span class="pill">普通用户</span>'}</td>
               <td>${esc(u.platform_name || "—")}</td>
+              <td>${u.role === "admin"
+                ? '<span style="color:var(--text3);font-size:12px">—</span>'
+                : `<button class="btn btn-sm ${u.can_audit ? "btn-green" : "btn-ghost"}"
+                     data-audit-user="${u.id}" data-on="${u.can_audit ? 1 : 0}"
+                     title="${u.can_audit ? "该账号可复核结项项目；点击取消" : "点击开启：项目结项后会收到「请审核」弹窗提醒"}">
+                     ${u.can_audit ? "审核员 ✓" : "开启审核"}</button>`}</td>
               <td>${u.active ? '<span class="st done">正常</span>' : '<span class="st undone">停用</span>'}</td>
               <td>${esc(u.last_login || "—")}</td>
               <td>
@@ -1619,6 +1628,19 @@ VIEWS.users = async (root) => {
     </div>`;
 
   $("#btnNewUser").addEventListener("click", () => newUserDialog());
+  $$("[data-audit-user]").forEach((b) => b.addEventListener("click", async () => {
+    const uid = b.dataset.auditUser;
+    const on = b.dataset.on === "1";
+    const u = users.find((x) => String(x.id) === String(uid)) || {};
+    if (!on && !confirm(`给「${u.display_name || u.username}」开启审核功能？\n\n`
+      + `开启后，项目结项时该账号会收到「请审核」弹窗提醒，\n`
+      + `复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。`)) return;
+    try {
+      await api("/api/users/" + uid, { method: "PUT", body: { can_audit: !on } });
+      toast(on ? "已取消审核功能" : "已开启审核功能");
+      go("users");
+    } catch (e) { toast(e.message, "error"); }
+  }));
   $$("[data-edit]").forEach((b) => b.addEventListener("click", () => {
     const u = users.find((x) => x.id === Number(b.dataset.edit));
     editUserDialog(u, u.id === meId);
@@ -1642,7 +1664,7 @@ VIEWS.users = async (root) => {
   }));
 };
 
-function rolePlatformFields(role, platform) {
+function rolePlatformFields(role, platform, canAudit) {
   const ro = (k) => ["ops", "design"].includes(k);
   return `
     <div class="field" style="margin-top:12px"><label>角色</label>
@@ -1655,14 +1677,28 @@ function rolePlatformFields(role, platform) {
       <select class="select" id="u_plat">
         ${Object.entries(PLATFORM_LABEL).map(([k, v]) =>
           `<option value="${k}"${k === platform ? " selected" : ""}>${v}${ro(k) ? "（只读）" : ""}</option>`).join("")}
-      </select></div>`;
+      </select></div>
+    <div class="field" id="auditField" style="margin-top:12px${role === "admin" ? ";display:none" : ""}">
+      <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer">
+        <input type="checkbox" id="u_audit"${canAudit ? " checked" : ""} style="width:auto;margin-top:3px">
+        <span style="font-size:12.5px;color:var(--text2);line-height:1.55">
+          <b>开启审核功能</b>：项目结项后该账号会收到「请审核」弹窗提醒，
+          复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。<br>
+          <span style="color:var(--text3)">（只对普通用户有效，管理员不需要）</span>
+        </span>
+      </label></div>`;
 }
 
 function bindRoleToggle(root) {
   const roleSel = $("#u_role", root);
   const platField = $("#platField", root);
+  const auditField = $("#auditField", root);
   if (!roleSel || !platField) return;
-  const sync = () => { platField.style.display = roleSel.value === "admin" ? "none" : ""; };
+  const sync = () => {
+    const isAdmin = roleSel.value === "admin";
+    platField.style.display = isAdmin ? "none" : "";
+    if (auditField) auditField.style.display = isAdmin ? "none" : "";
+  };
   roleSel.addEventListener("change", sync); sync();
 }
 
@@ -1678,7 +1714,7 @@ function newUserDialog() {
         <input class="input" id="u_display" placeholder="可不填"></div>
       <div class="field" style="margin-top:12px"><label>初始密码</label>
         <input class="input" id="u_pwd" placeholder="至少 6 位"></div>
-      ${rolePlatformFields("user", "cell")}`,
+      ${rolePlatformFields("user", "cell", false)}`,
     footer: `<span style="flex:1"></span>
       <button class="btn btn-ghost" data-close>取消</button>
       <button class="btn btn-primary" data-ok>创建</button>`,
@@ -1686,6 +1722,7 @@ function newUserDialog() {
       bindRoleToggle(root);
       $("[data-ok]", root).addEventListener("click", async () => {
         try {
+          const auditBox = $("#u_audit", root);
           await api("/api/users", {
             method: "POST",
             body: {
@@ -1694,6 +1731,7 @@ function newUserDialog() {
               password: $("#u_pwd", root).value,
               role: $("#u_role", root).value,
               platform: $("#u_plat", root) ? $("#u_plat", root).value : "",
+              can_audit: !!(auditBox && auditBox.checked),
             },
           });
           closeModal(); toast("已创建账号"); go("users");
@@ -1713,7 +1751,7 @@ function editUserDialog(u, isSelf) {
         <input class="input" value="${esc(u.username)}" disabled></div>
       <div class="field" style="margin-top:12px"><label>姓名 / 昵称</label>
         <input class="input" id="e_display" value="${esc(u.display_name)}"></div>
-      ${rolePlatformFields(u.role, u.platform)}`,
+      ${rolePlatformFields(u.role, u.platform, !!u.can_audit)}`,
     footer: `<span style="flex:1"></span>
       <button class="btn btn-ghost" data-close>取消</button>
       <button class="btn btn-primary" data-ok>保存</button>`,
@@ -1721,12 +1759,14 @@ function editUserDialog(u, isSelf) {
       bindRoleToggle(root);
       $("[data-ok]", root).addEventListener("click", async () => {
         try {
+          const auditBox = $("#u_audit", root);
           await api("/api/users/" + u.id, {
             method: "PUT",
             body: {
               display_name: $("#e_display", root).value.trim(),
               role: $("#u_role", root).value,
               platform: $("#u_plat", root) ? $("#u_plat", root).value : "",
+              can_audit: !!(auditBox && auditBox.checked),
             },
           });
           closeModal(); toast("已保存"); go("users");

@@ -198,6 +198,52 @@ CREATE TABLE IF NOT EXISTS worklogs(
   updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_worklogs_user_date ON worklogs(user_id, log_date);
+
+-- 站内通知（消息中心）：按「角色」广播，已读状态按用户存。
+--   target_role='user'   → 发给所有普通账户（管理员新增项目入库时）
+--   target_role='admin'  → 发给所有管理员（实验员勾选平台完成 / 项目结项时）
+--   popup=1 → 目标用户登录后弹「闪烁流光横幅」；popup=0 → 只在消息中心显示未读。
+CREATE TABLE IF NOT EXISTS notifications(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category TEXT NOT NULL,                 -- project_in 项目入库 / platform_done 平台完成 / project_done 项目结项
+  target_role TEXT NOT NULL DEFAULT 'user',
+  title TEXT NOT NULL DEFAULT '',         -- 主文案（消息中心与横幅都用它）
+  body TEXT DEFAULT '',                   -- 详情（编号清单等）
+  ptype TEXT DEFAULT '',                  -- 关联项目类型
+  code TEXT DEFAULT '',                   -- 关联项目编号
+  platform TEXT DEFAULT '',               -- 关联平台（平台完成用）
+  project_id INTEGER DEFAULT 0,           -- 关联项目 id
+  popup INTEGER NOT NULL DEFAULT 0,       -- 1 = 登录后弹横幅
+  created_by INTEGER DEFAULT 0,           -- 触发人（管理员/实验员 id）
+  created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_notif_role ON notifications(target_role, id);
+
+CREATE TABLE IF NOT EXISTS notification_reads(
+  notification_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  read_at TEXT,
+  hidden INTEGER NOT NULL DEFAULT 0,      -- 1 = 该用户已把这条从自己的消息中心清掉
+  PRIMARY KEY(notification_id, user_id)
+);
+
+-- 结项待审核：项目所有被设计平台都完成后生成一条，由「有审核权限的普通账户」复核。
+--   审核完成后 status='done'，并通知全体管理员「某某某已审核完成，请复审」。
+--   同一项目再次结项（先取消再勾回来）会把这条重置成 pending。
+CREATE TABLE IF NOT EXISTS project_audits(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ptype TEXT NOT NULL,
+  code TEXT NOT NULL,
+  project_id INTEGER DEFAULT 0,
+  name TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending 待审核 / done 已审核
+  auditor_id INTEGER DEFAULT 0,
+  auditor_name TEXT DEFAULT '',
+  created_at TEXT,
+  reviewed_at TEXT,
+  UNIQUE(ptype, code)
+);
+CREATE INDEX IF NOT EXISTS ix_audits_status ON project_audits(status, id);
 """
 
 # ------------------------------------------------------------------ 路径
@@ -251,10 +297,13 @@ def tx():
 
 
 def _migrate(conn) -> None:
-    """老库升级：补 seq 列，并把唯一索引从 (ptype,code,disc) 换成带 seq 的四列。
+    """老库升级。
 
-    旧索引会阻止「同编号 + 同内容」的多行并存（同一项目多次返修会被吞掉），
-    所以必须换掉；存量数据 seq 默认 0，组内本来就只有一行，迁移后依然唯一。
+    ① 补 projects.seq 列，并把唯一索引从 (ptype,code,disc) 换成带 seq 的四列。
+       旧索引会阻止「同编号 + 同内容」的多行并存（同一项目多次返修会被吞掉），
+       所以必须换掉；存量数据 seq 默认 0，组内本来就只有一行，迁移后依然唯一。
+    ② 补 users.can_audit 列（审核权限，2026-10-14 新增）。
+    ③ 补 notification_reads.hidden 列（「清空消息中心」按人隐藏，2026-10-14 新增）。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     if "seq" not in cols:
@@ -265,6 +314,12 @@ def _migrate(conn) -> None:
     if row is not None and "seq" not in (row["sql"] or ""):
         conn.execute("DROP INDEX IF EXISTS uq_projects")
         conn.execute("CREATE UNIQUE INDEX uq_projects ON projects(ptype, code, disc, seq)")
+    ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if ucols and "can_audit" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN can_audit INTEGER DEFAULT 0")
+    ncols = {r["name"] for r in conn.execute("PRAGMA table_info(notification_reads)")}
+    if ncols and "hidden" not in ncols:
+        conn.execute("ALTER TABLE notification_reads ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
 
 
 def init_db() -> None:
@@ -437,10 +492,12 @@ def upsert_projects_bulk(rows: list) -> tuple:
     「同编号+同内容」的第几次出现算出，因此：
       - 源表里两行完全相同的内容 → seq 不同 → 两行都保留；
       - 同一份文件重复导入 → seq 相同 → 覆盖更新，不会翻倍。
-    返回 (created, updated)。
+    返回 (created, updated, created_items)：
+      created_items = [{"ptype":..., "code":...}, ...] 本次**新增**的行，
+      供上层（导入接口）生成「xx项目已入库」通知。
     """
     if not rows:
-        return 0, 0
+        return 0, 0, []
 
     # 先算出每行的 fields（复用单条逻辑的构造方式，保证字段一致）
     prepared = []
@@ -467,9 +524,10 @@ def upsert_projects_bulk(rows: list) -> tuple:
             "note": str(payload.get("note") or ""),
         }))
     if not prepared:
-        return 0, 0
+        return 0, 0, []
 
     created = updated = 0
+    created_items = []
     now = _now()
     cols = ("name", "src_row", "cell", "mol", "path", "animal",
             "extra", "price", "audit_sun", "audit_xu", "send_date", "note")
@@ -494,7 +552,8 @@ def upsert_projects_bulk(rows: list) -> tuple:
                     [ptype, code, disc, seq] + [fields[k] for k in cols] + [now],
                 )
                 created += 1
-    return created, updated
+                created_items.append({"ptype": ptype, "code": code, "name": fields["name"]})
+    return created, updated, created_items
 
 
 def upsert_project(payload: dict) -> int:
@@ -1234,3 +1293,373 @@ def worklog_months(user_id: int) -> list:
             "SELECT substr(log_date,1,7) AS m, COUNT(*) AS n FROM worklogs "
             "WHERE user_id=? GROUP BY m ORDER BY m DESC", (user_id,)).fetchall()
     return [{"month": r["m"], "count": r["n"]} for r in rows]
+
+
+# ================================================================== 消息中心 / 站内通知
+# 规则（2026-10-14 与用户确认）：
+#   · 管理员新增「真实 / 加急 / 返修」项目 → 通知所有普通账户，登录时弹流光横幅；
+#     「库存」项目只进消息中心（未读），不弹横幅。
+#   · 普通账户把某项目某平台勾成 ✅ → 通知所有管理员；
+#     若该项目所有被设计平台都完成 → 再补一条「已结项，请审核」。
+# 已读状态按用户存（notification_reads），所以「谁看过」互不影响。
+NOTIF_PROJECT_IN = "project_in"        # 项目入库
+NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成
+NOTIF_PROJECT_DONE = "project_done"    # 项目结项（待审核）
+NOTIF_AUDIT_REQUEST = "audit_request"  # 结项待审核（发给有审核权限的普通账户）
+NOTIF_AUDIT_DONE = "audit_done"        # 审核完成（发给管理员）
+NOTIF_CATEGORY_NAME = {
+    NOTIF_PROJECT_IN: "项目入库",
+    NOTIF_PLATFORM_DONE: "平台完成",
+    NOTIF_PROJECT_DONE: "项目结项",
+    NOTIF_AUDIT_REQUEST: "待审核",
+    NOTIF_AUDIT_DONE: "审核完成",
+}
+ROLE_ADMIN = "admin"
+ROLE_USER = "user"
+ROLE_AUDITOR = "auditor"   # 不是真实角色，只是「审核员」这一受众标签
+
+
+def _notif_public(row: dict, read: bool = False) -> dict:
+    return {
+        "id": row["id"],
+        "category": row.get("category") or "",
+        "category_name": NOTIF_CATEGORY_NAME.get(row.get("category"), row.get("category") or ""),
+        "title": row.get("title") or "",
+        "body": row.get("body") or "",
+        "ptype": row.get("ptype") or "",
+        "type_label": TYPE_NAME.get(row.get("ptype"), row.get("ptype") or ""),
+        "code": row.get("code") or "",
+        "platform": row.get("platform") or "",
+        "platform_label": PLATFORM_LABEL.get(row.get("platform"), row.get("platform") or ""),
+        "project_id": int(row.get("project_id") or 0),
+        "popup": bool(row.get("popup")),
+        "created_at": row.get("created_at") or "",
+        "read": bool(read),
+        # 仅「待审核」类消息会填：对应 project_audits 的 id 与当前状态
+        "audit_id": 0,
+        "audit_pending": False,
+    }
+
+
+def _annotate_audits(items: list) -> list:
+    """给「待审核」消息补上 audit_id / audit_pending，前端据此决定要不要出「审核完成」按钮。"""
+    keys = {(x["ptype"], x["code"]) for x in items if x.get("category") == NOTIF_AUDIT_REQUEST}
+    if not keys:
+        return items
+    amap = audit_map()
+    for x in items:
+        if x.get("category") != NOTIF_AUDIT_REQUEST:
+            continue
+        a = amap.get((x["ptype"], x["code"]))
+        if a:
+            x["audit_id"] = a["id"]
+            x["audit_pending"] = a["status"] == "pending"
+            if a.get("auditor_name"):
+                x["audit_auditor"] = a["auditor_name"]
+    return items
+
+
+def add_notification(category: str, target_role: str, title: str, body: str = "",
+                     ptype: str = "", code: str = "", platform: str = "",
+                     project_id: int = 0, popup: bool = False,
+                     created_by: int = 0) -> int:
+    """写一条通知，返回 id。target_role = 'user'（全员普通账户）/ 'admin'（全员管理员）。"""
+    with tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO notifications(category,target_role,title,body,ptype,code,"
+            "platform,project_id,popup,created_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (category, target_role, (title or "").strip(), (body or "").strip(),
+             ptype or "", str(code or ""), platform or "", int(project_id or 0),
+             1 if popup else 0, int(created_by or 0), _now()))
+        return cur.lastrowid
+
+
+def add_notifications_bulk(rows: list) -> int:
+    """批量写通知（同一事务）。rows = [{category,target_role,title,body,...}, ...]"""
+    rows = [r for r in (rows or []) if r and r.get("title")]
+    if not rows:
+        return 0
+    now = _now()
+    with tx() as conn:
+        for r in rows:
+            conn.execute(
+                "INSERT INTO notifications(category,target_role,title,body,ptype,code,"
+                "platform,project_id,popup,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (r.get("category") or "", r.get("target_role") or ROLE_USER,
+                 str(r.get("title") or "").strip(), str(r.get("body") or "").strip(),
+                 r.get("ptype") or "", str(r.get("code") or ""), r.get("platform") or "",
+                 int(r.get("project_id") or 0), 1 if r.get("popup") else 0,
+                 int(r.get("created_by") or 0), now))
+    return len(rows)
+
+
+def _role_of(user) -> str:
+    return ROLE_ADMIN if (user or {}).get("role") == ROLE_ADMIN else ROLE_USER
+
+
+def roles_for(user) -> list:
+    """这个用户能看到哪些受众标签的通知。
+
+    管理员 → ['admin']；普通账户 → ['user']；**有审核权限的普通账户**再多一个 'auditor'，
+    这样他既收得到「项目已入库」，也收得到「结项待审核」。
+    """
+    if (user or {}).get("role") == ROLE_ADMIN:
+        return [ROLE_ADMIN]
+    roles = [ROLE_USER]
+    if (user or {}).get("can_audit"):
+        roles.append(ROLE_AUDITOR)
+    return roles
+
+
+def list_notifications(user_id: int, roles, limit: int = 200,
+                       unread_only: bool = False, popup_only: bool = False) -> list:
+    """当前用户可见的通知（按受众标签 + 自己的已读状态）。倒序。
+
+    roles 可以是单个字符串（兼容旧调用）或列表。
+    """
+    if isinstance(roles, str):
+        roles = [roles]
+    roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    where = [f"n.target_role IN ({','.join('?' * len(roles))})"]
+    args = list(roles)
+    if unread_only:
+        where.append("r.notification_id IS NULL")
+    if popup_only:
+        where.append("n.popup=1")
+    # 「清空消息中心」= 给自己写一条 hidden=1 的记录，只对自己隐藏
+    where.append("COALESCE(r.hidden,0)=0")
+    sql = (f"SELECT n.*, r.read_at FROM notifications n "
+           f"LEFT JOIN notification_reads r "
+           f"  ON r.notification_id=n.id AND r.user_id=? "
+           f"WHERE {' AND '.join(where)} ORDER BY n.id DESC LIMIT ?")
+    with tx() as conn:
+        rows = conn.execute(sql, [user_id] + args + [int(limit or 200)]).fetchall()
+    return _annotate_audits(
+        [_notif_public(dict(r), read=r["read_at"] is not None) for r in rows])
+
+
+def notif_unread_count(user_id: int, roles) -> int:
+    if isinstance(roles, str):
+        roles = [roles]
+    roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    with tx() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) n FROM notifications n "
+            f"LEFT JOIN notification_reads r "
+            f"  ON r.notification_id=n.id AND r.user_id=? "
+            f"WHERE n.target_role IN ({','.join('?' * len(roles))}) "
+            f"  AND r.notification_id IS NULL",
+            [user_id] + roles).fetchone()["n"]
+
+def notif_pending_popups(user_id: int, roles, limit: int = 20) -> list:
+    """需要弹横幅的未读通知（popup=1）。用户标记已读后就不再返回。
+
+    ⚠️「已复核完成」的待审核提醒不再弹：那条 audit_request 只是历史记录，
+    再打断审核员毫无意义（列表里仍能看到，状态是 ✅ 已审核）。
+    """
+    rows = list_notifications(user_id, roles, limit=limit,
+                              unread_only=True, popup_only=True)
+    return [x for x in rows
+            if not (x.get("category") == NOTIF_AUDIT_REQUEST and x.get("audit_id")
+                    and not x.get("audit_pending"))]
+
+
+def mark_notif_read_for_project(user_id: int, category: str, ptype: str,
+                                code: str) -> int:
+    """把「我」的某项目某类通知标记为已读。
+
+    用于审核完成后自动收掉审核员那条「xx项目已结项，请审核」——
+    事情已经办完了，不该继续挂在未读里。
+    """
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT id FROM notifications WHERE category=? AND ptype=? "
+            "AND UPPER(code)=UPPER(?)", (category, ptype, str(code or ""))).fetchall()
+        now = _now()
+        for r in rows:
+            conn.execute(
+                "INSERT INTO notification_reads(notification_id,user_id,read_at) "
+                "VALUES(?,?,?) ON CONFLICT(notification_id,user_id) "
+                "DO UPDATE SET read_at=excluded.read_at",
+                (r["id"], user_id, now))
+    return len(rows)
+
+
+def mark_notifications_read(user_id: int, ids=None, roles=None) -> int:
+    """标记已读。ids=None 表示「全部已读」，否则只标记给定 id（且必须是自己角色可见的）。
+
+    ⚠️ 全部已读必须按 roles 过滤：审核员还有 target_role='auditor' 的「待审核」消息，
+    早期写死 IN ('user','admin') 会让审核员点「全部已读」后那批仍是未读。
+    """
+    ids = [int(i) for i in (ids or [])] if ids is not None else None
+    if isinstance(roles, str):
+        roles = [roles]
+    roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    now = _now()
+    with tx() as conn:
+        if ids is None:
+            rows = conn.execute(
+                f"SELECT id FROM notifications WHERE target_role IN "
+                f"({','.join('?' * len(roles))})", roles).fetchall()
+        else:
+            if not ids:
+                return 0
+            marks = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT id FROM notifications WHERE id IN ({marks})", ids).fetchall()
+        n = 0
+        for r in rows:
+            conn.execute(
+                "INSERT INTO notification_reads(notification_id,user_id,read_at) "
+                "VALUES(?,?,?) ON CONFLICT(notification_id,user_id) "
+                "DO UPDATE SET read_at=excluded.read_at",
+                (r["id"], user_id, now))
+            n += 1
+    return n
+
+
+def hide_notifications(user_id: int, roles) -> int:
+    """清空「我」的消息中心：把当前用户可见的通知全部标记为已读 + 隐藏。
+
+    通知是按受众标签广播的（没有 per-user 行），所以「清空」只能按人隐藏：
+    给当前用户写一条 hidden=1 的已读记录。别人的消息中心完全不受影响，
+    「待我审核」这类独立工作台也不受影响。
+    """
+    if isinstance(roles, str):
+        roles = [roles]
+    roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    now = _now()
+    with tx() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM notifications WHERE target_role IN "
+            f"({','.join('?' * len(roles))})", roles).fetchall()
+        for r in rows:
+            conn.execute(
+                "INSERT INTO notification_reads(notification_id,user_id,read_at,hidden) "
+                "VALUES(?,?,?,1) ON CONFLICT(notification_id,user_id) "
+                "DO UPDATE SET read_at=excluded.read_at, hidden=1",
+                (r["id"], user_id, now))
+    return len(rows)
+
+
+def clear_notifications() -> int:
+    """清空全部通知与已读记录（数据维护用）。"""
+    with tx() as conn:
+        n = conn.execute("SELECT COUNT(*) n FROM notifications").fetchone()["n"]
+        conn.execute("DELETE FROM notifications")
+        conn.execute("DELETE FROM notification_reads")
+    return n
+
+
+# ================================================================== 结项审核
+def _audit_public(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "ptype": row.get("ptype") or "",
+        "type_label": TYPE_NAME.get(row.get("ptype"), row.get("ptype") or ""),
+        "code": row.get("code") or "",
+        "name": row.get("name") or "",
+        "project_id": int(row.get("project_id") or 0),
+        "status": row.get("status") or "pending",
+        "status_name": {"pending": "待审核", "done": "已审核"}.get(row.get("status"), "待审核"),
+        "auditor_id": int(row.get("auditor_id") or 0),
+        "auditor_name": row.get("auditor_name") or "",
+        "created_at": row.get("created_at") or "",
+        "reviewed_at": row.get("reviewed_at") or "",
+    }
+
+
+def upsert_audit(ptype: str, code: str, project_id: int = 0, name: str = "") -> dict:
+    """项目结项 → 生成/重置一条待审核记录（同一项目只保留一条）。
+
+    先取消勾选再重新勾上（重新结项）时会重置成 pending，审核人信息清空。
+    """
+    ptype = (ptype or "").strip()
+    code = str(code or "").strip().upper()
+    if not ptype or not code:
+        raise ValueError("项目类型与编号不能为空")
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO project_audits(ptype,code,project_id,name,status,"
+            "auditor_id,auditor_name,created_at,reviewed_at) "
+            "VALUES(?,?,?,?,'pending',0,'',?,'') "
+            "ON CONFLICT(ptype,code) DO UPDATE SET "
+            "  project_id=excluded.project_id, name=excluded.name, status='pending', "
+            "  auditor_id=0, auditor_name='', created_at=excluded.created_at, reviewed_at=''",
+            (ptype, code, int(project_id or 0), (name or "").strip(), _now()))
+        row = conn.execute(
+            "SELECT * FROM project_audits WHERE ptype=? AND code=?", (ptype, code)).fetchone()
+    return _audit_public(dict(row))
+
+
+def get_audit(aid: int):
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM project_audits WHERE id=?", (int(aid or 0),)).fetchone()
+    return _audit_public(dict(row)) if row else None
+
+
+def audit_map() -> dict:
+    """{(ptype, code): {id, status, auditor_name}} 一次取全，供通知列表打标。"""
+    with tx() as conn:
+        rows = conn.execute("SELECT id, ptype, code, status, auditor_name FROM project_audits").fetchall()
+    return {(r["ptype"], r["code"]): {"id": r["id"], "status": r["status"],
+                                      "auditor_name": r["auditor_name"] or ""} for r in rows}
+
+
+def list_audits(status: str = "pending", limit: int = 200) -> list:
+    where, args = "", []
+    if status:
+        where = "WHERE status=?"
+        args.append(status)
+    with tx() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM project_audits {where} ORDER BY id DESC LIMIT ?",
+            args + [int(limit or 200)]).fetchall()
+    return [_audit_public(dict(r)) for r in rows]
+
+
+def count_audits(status: str = "pending") -> int:
+    where, args = "", []
+    if status:
+        where = "WHERE status=?"
+        args.append(status)
+    with tx() as conn:
+        return conn.execute(f"SELECT COUNT(*) n FROM project_audits {where}", args).fetchone()["n"]
+
+
+def complete_audit(aid: int, auditor: dict):
+    """审核员复核完成：标记 done 并记下审核人。已审核过则返回 None（避免重复通知）。"""
+    auditor = auditor or {}
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM project_audits WHERE id=?", (int(aid or 0),)).fetchone()
+        if not row:
+            return None
+        row = dict(row)
+        if row.get("status") == "done":
+            return None
+        conn.execute(
+            "UPDATE project_audits SET status='done', auditor_id=?, auditor_name=?, reviewed_at=? "
+            "WHERE id=?",
+            (int(auditor.get("id") or 0), auditor.get("display_name") or auditor.get("username") or "",
+             _now(), row["id"]))
+        new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (row["id"],)).fetchone())
+    return _audit_public(new)
+
+
+def list_auditors() -> list:
+    """有审核权限、且启用中的普通账户。"""
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT id, username, display_name, platform FROM users "
+            "WHERE role=? AND can_audit=1 AND active=1 ORDER BY id",
+            (ROLE_USER,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_auditor() -> bool:
+    with tx() as conn:
+        return bool(conn.execute(
+            "SELECT 1 FROM users WHERE role=? AND can_audit=1 AND active=1 LIMIT 1",
+            (ROLE_USER,)).fetchone())

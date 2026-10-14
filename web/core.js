@@ -13,6 +13,8 @@ const state = {
             platform: "", status: "", order: "asc", sort: "code", group: "type" },
   import: { preview: null, path: "", busy: false },
   month: { mid: 0, detail: null, list: [] },
+  notif: { items: [], unread: 0, popups: [], audits: [], canAudit: false,
+           open: false, bannerOpen: false, timer: 0 },
 };
 
 const TYPE_CLASS = { real: "t-real", urgent: "t-urgent", stock: "t-stock", repair: "t-repair" };
@@ -191,6 +193,302 @@ function alertDialog(title, bodyHtml, okText = "知道了") {
   });
 }
 
+/* ================================================ 消息中心（站内通知）
+   数据来自 /api/notifications。通知按**角色**广播（普通账户一套 / 管理员一套），
+   已读状态按**用户**存 —— 谁看过互不影响，看过之后就不再弹横幅。
+     · 项目入库（普通账户收）：真实/加急/返修 → 登录弹「流光横幅」；库存只进消息中心。
+     · 平台完成 / 项目结项（管理员收）：只在消息中心显示未读，不弹窗。 */
+const NOTIF_ICON = { project_in: "📦", platform_done: "✅", project_done: "🏁",
+                     audit_request: "🔎", audit_done: "🛡️" };
+const NOTIF_TAG = { project_in: "项目入库", platform_done: "平台完成", project_done: "项目结项",
+                    audit_request: "待审核", audit_done: "审核完成" };
+
+function notifTime(s) {
+  const t = String(s || "");
+  const m = t.match(/^\d{4}-(\d{2}-\d{2})[ T](\d{2}:\d{2})/);   // 2026-10-14 09:12:33
+  return m ? `${m[1]} ${m[2]}` : (t || "");
+}
+
+/* 消息里的项目类型标签（真实 / 加急 / 库存 / 返修），横幅与消息中心都用它，
+   让人一眼看出这条通知说的是哪一类项目。 */
+function notifTypePill(ptype) {
+  if (!ptype) return "";
+  const label = TYPE_LABEL[ptype] || ptype;
+  return `<span class="pill ${TYPE_PILL[ptype] || ""}">${esc(label)}</span>`;
+}
+
+async function loadNotifications({ popup = true, silent = true } = {}) {
+  let r;
+  try {
+    r = await api("/api/notifications");
+  } catch (e) {
+    if (!silent) toast(e.message, "error");
+    return;
+  }
+  const d = r.data || {};
+  state.notif.items = d.items || [];
+  state.notif.unread = d.unread || 0;
+  state.notif.popups = d.popups || [];
+  state.notif.canAudit = !!d.can_audit;
+  state.notif.audits = d.audits || [];
+  renderNotifBadge();
+  if (state.notif.open) renderNotifPanel();
+  if (popup && state.notif.popups.length) showNotifBanner(state.notif.popups);
+}
+
+function renderNotifBadge() {
+  const b = $("#notifBadge");
+  const bell = $("#notifBell");
+  if (!b) return;
+  const n = state.notif.unread || 0;
+  if (n > 0) { b.hidden = false; b.textContent = n > 99 ? "99+" : String(n); }
+  else { b.hidden = true; b.textContent = "0"; }
+  if (bell) bell.classList.toggle("has-unread", n > 0);
+}
+
+function notifItemHtml(n) {
+  const tag = NOTIF_TAG[n.category] || "";
+  const icon = NOTIF_ICON[n.category] || "🔔";
+  const isAudit = n.category === "audit_request";
+  const act = isAudit
+    ? (n.audit_pending
+        ? `<div class="ni-act"><button class="btn btn-green btn-sm" data-audit="${n.audit_id}">审核完成</button>
+             <span class="ni-hint">复核无误后点这里，管理员会收到通知</span></div>`
+        : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`)
+    : "";
+  return `<div class="notif-item${n.read ? "" : " unread"}" data-nid="${n.id}"
+      ${n.code ? `data-code="${esc(n.code)}"` : ""}
+      title="${n.code ? "点击到项目库查看该项目" : ""}">
+    <span class="ni-icon">${icon}</span>
+    <div class="ni-main">
+      <div class="ni-title">${notifTypePill(n.ptype)}${esc(n.title)}</div>
+      ${n.body ? `<div class="ni-body">${esc(n.body)}</div>` : ""}
+      <div class="ni-meta">${tag ? `<span class="ni-tag">${esc(tag)}</span>` : ""}<span>${esc(notifTime(n.created_at))}</span></div>
+      ${act}
+    </div>
+    ${n.read ? "" : '<span class="ni-dot"></span>'}
+  </div>`;
+}
+
+/* 「待我审核」区块：审核员的工作台。比通知更可靠 —— 只要项目还是 pending 就在这儿。 */
+function notifAuditHtml() {
+  const list = state.notif.audits || [];
+  if (!state.notif.canAudit || !list.length) return "";
+  const shown = list.slice(0, 8);
+  return `
+    <div class="notif-audit">
+      <div class="na-head">待我审核 <span class="np-pill">${list.length} 个</span></div>
+      ${shown.map((a) => `
+        <div class="na-item">
+          <div class="na-main">
+            <div class="na-title">${notifTypePill(a.ptype)}${esc(a.code)} 项目已结项</div>
+            <div class="na-sub">${esc(a.name) || "—"}</div>
+          </div>
+          <button class="btn btn-green btn-sm" data-audit="${a.id}">审核完成</button>
+        </div>`).join("")}
+      ${list.length > shown.length ? `<div class="na-more">还有 ${list.length - shown.length} 个…</div>` : ""}
+    </div>`;
+}
+
+function renderNotifPanel() {
+  const root = $("#notifRoot");
+  if (!root) return;
+  if (!state.notif.open) {
+    // 只清面板，别把正在显示的横幅一起清掉
+    const p = $("#notifPanel", root);
+    if (p) p.remove();
+    const m = $("[data-notif-mask]", root);
+    if (m) m.remove();
+    return;
+  }
+  const items = state.notif.items || [];
+  root.innerHTML = `
+    <div class="notif-mask" data-notif-mask></div>
+    <div class="notif-panel" id="notifPanel">
+      <div class="notif-head">
+        <h4>消息中心${state.notif.unread ? ` <span class="np-pill">${state.notif.unread} 条未读</span>` : ""}</h4>
+        <div class="np-acts">
+          <button class="btn btn-ghost btn-sm" data-notif-allread${state.notif.unread ? "" : " disabled"}>全部已读</button>
+          <button class="btn btn-ghost btn-sm" data-notif-clear${items.length ? "" : " disabled"}>清空</button>
+          <button class="np-close" data-notif-close title="关闭">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="notif-list">
+        ${notifAuditHtml()}
+        ${items.length ? items.map(notifItemHtml).join("")
+          : '<div class="notif-empty">暂时没有消息</div>'}
+      </div>
+      <div class="notif-foot">${isAdmin()
+        ? "实验员把平台勾成 ✅、审核员复核完成后，这里会收到「平台完成 / 项目结项 / 审核完成」提醒。"
+        : state.notif.canAudit
+          ? "管理员新增项目后这里会收到「项目已入库」；项目结项后这里会出现「待审核」，复核完点「审核完成」。"
+          : "管理员新增项目后，这里会收到「项目已入库」提醒。"}</div>
+    </div>`;
+  bindNotifPanel();
+}
+
+/* 审核完成：复核无误 → 后端标记 done 并通知全体管理员「某某某已审核完成，请复审」。 */
+async function finishAudit(aid, btn) {
+  if (!aid) return;
+  const el = btn || null;
+  if (el) el.disabled = true;
+  try {
+    await api(`/api/audits/${aid}/done`, { method: "POST", body: {} });
+  } catch (e) {
+    if (el) el.disabled = false;
+    return toast(e.message, "error");
+  }
+  toast("已审核完成，已通知管理员复审");
+  await loadNotifications({ popup: false });
+  if (state.notif.open) renderNotifPanel();
+}
+
+function bindNotifPanel() {
+  const root = $("#notifRoot");
+  if (!root || !state.notif.open) return;
+  const panel = $("#notifPanel", root);
+  if (!panel) return;
+  const close = () => { state.notif.open = false; renderNotifPanel(); };
+  root.querySelectorAll("[data-notif-mask],[data-notif-close]").forEach((el) =>
+    el.addEventListener("click", close));
+
+  // 「审核完成」按钮：别让它冒泡触发外层的「点消息跳项目库」
+  root.querySelectorAll("[data-audit]").forEach((el) => el.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    finishAudit(Number(el.dataset.audit), el);
+  }));
+
+  const all = panel.querySelector("[data-notif-allread]");
+  if (all) all.addEventListener("click", async () => {
+    try { await api("/api/notifications/read", { method: "POST", body: { all: true } }); }
+    catch (e) { return toast(e.message, "error"); }
+    (state.notif.items || []).forEach((x) => { x.read = true; });
+    state.notif.unread = 0;
+    state.notif.popups = [];
+    renderNotifBadge();
+    renderNotifPanel();
+    toast("已全部标记为已读");
+  });
+
+  // 清空：把「我」的消息列表整个清掉（按人隐藏，别人的消息中心不受影响）
+  const clr = panel.querySelector("[data-notif-clear]");
+  if (clr) clr.addEventListener("click", async () => {
+    if (!(state.notif.items || []).length) return;
+    if (!confirm("确定清空消息中心？\n\n"
+      + "· 只清空你自己的消息列表，其他账号的消息不受影响；\n"
+      + "· 「待我审核」工作台不受影响，待审核项目仍会列出；\n"
+      + "· 清空后这些消息不会再弹横幅。")) return;
+    clr.disabled = true;
+    try {
+      await api("/api/notifications/clear", { method: "POST", body: {} });
+    } catch (e) {
+      clr.disabled = false;
+      return toast(e.message, "error");
+    }
+    state.notif.items = [];
+    state.notif.unread = 0;
+    state.notif.popups = [];
+    renderNotifBadge();
+    await loadNotifications({ popup: false });
+    if (state.notif.open) renderNotifPanel();
+    toast("消息已清空");
+  });
+
+  panel.querySelectorAll(".notif-item").forEach((el) => el.addEventListener("click", async () => {
+    const nid = Number(el.dataset.nid);
+    const code = el.dataset.code || "";
+    const item = (state.notif.items || []).find((x) => x.id === nid);
+    if (item && !item.read) {
+      try { await api("/api/notifications/read", { method: "POST", body: { ids: [nid] } }); }
+      catch (e) { /* 标已读失败不影响跳转 */ }
+      item.read = true;
+      state.notif.unread = Math.max(0, (state.notif.unread || 0) - 1);
+      state.notif.popups = (state.notif.popups || []).filter((x) => x.id !== nid);
+      renderNotifBadge();
+    }
+    if (code) {
+      state.notif.open = false;
+      renderNotifPanel();
+      state.browse.search = code;
+      state.browse.page = 1;
+      go("browse");                     // 直接跳到项目库并按编号搜出来
+    } else {
+      renderNotifPanel();
+    }
+  }));
+}
+
+function toggleNotifPanel() {
+  state.notif.open = !state.notif.open;
+  renderNotifPanel();
+  if (state.notif.open) loadNotifications({ popup: false });
+}
+
+/* 登录后的「闪烁流光横幅」：一条或多条入库通知合并成一个横幅，
+   点「立即查看」跳到消息中心，「知道了」直接关掉 —— 两种操作都标记已读，
+   标记过之后同一账户再登录就不会再弹（已读按用户存）。 */
+function showNotifBanner(popups) {
+  if (state.notif.bannerOpen) return;              // 一次只弹一个，别叠罗汉
+  const list = (popups || []).filter((x) => x && x.id);
+  if (!list.length) return;
+  const root = $("#notifRoot");
+  if (!root) return;
+  state.notif.bannerOpen = true;
+  const n = list.length;
+  const first = list[0];
+  const more = list.slice(1, 4)
+    .map((x) => `<li>${notifTypePill(x.ptype)}${esc(x.title)}</li>`).join("");
+  const extra = n > 1
+    ? `<div class="nb-more">另有 ${n - 1} 条：<ul>${more}${n > 4 ? "<li>…</li>" : ""}</ul></div>`
+    : "";
+  const wrap = document.createElement("div");
+  wrap.className = "notif-banner-wrap";
+  wrap.innerHTML = `
+    <div class="notif-banner">
+      <span class="nb-ring"></span>
+      <div class="nb-icon">🔔</div>
+      <div class="nb-text">
+        <div class="nb-kicker">新消息提醒</div>
+        <div class="nb-title">${notifTypePill(first.ptype)}${esc(first.title)}</div>
+        ${first.body ? `<div class="nb-sub">${esc(first.body)}</div>` : ""}
+        ${extra}
+      </div>
+      <div class="nb-acts">
+        <button class="btn btn-primary btn-sm" data-nb-view>立即查看</button>
+        <button class="btn btn-ghost btn-sm" data-nb-ok>知道了</button>
+      </div>
+    </div>`;
+  root.appendChild(wrap);
+  const ids = list.map((x) => x.id);
+  let closed = false;
+  const done = async (view) => {
+    if (closed) return;
+    closed = true;
+    wrap.remove();
+    state.notif.bannerOpen = false;
+    try { await api("/api/notifications/read", { method: "POST", body: { ids } }); }
+    catch (e) { /* 失败也照常关闭，下次登录还会再提醒 */ }
+    state.notif.popups = [];
+    await loadNotifications({ popup: false });
+    if (view) { state.notif.open = true; renderNotifPanel(); }
+  };
+  wrap.querySelector("[data-nb-view]").addEventListener("click", () => done(true));
+  wrap.querySelector("[data-nb-ok]").addEventListener("click", () => done(false));
+}
+
+/* 轮询：管理员新加项目时，已经开着的普通账户也能收到横幅（不必等重新登录）。
+   重新获得焦点时也拉一次，够轻量。 */
+function startNotifPolling(ms = 45000) {
+  if (state.notif.timer) clearInterval(state.notif.timer);
+  state.notif.timer = setInterval(() => loadNotifications({ popup: true }), ms);
+}
+window.addEventListener("focus", () => {
+  if (state.me) loadNotifications({ popup: true });
+});
+
 /* ------------------------------------------------ 导航 */
 const ICONS = {
   dashboard: '<path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 9h8V3h-8z"/>',
@@ -241,13 +539,52 @@ function renderUserBox() {
       <div class="ub-name">${esc(u.display_name)}${badge}</div>
       <div class="ub-sub">${esc(sub)}</div>
     </div>
-    <button class="ub-out" id="btnLogout" title="退出登录">
+    <button class="ub-out" id="btnLogout" title="切换账号 / 退出登录">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
-    </button>`;
-  $("#btnLogout").addEventListener("click", async () => {
-    try { await api("/api/auth/logout", { method: "POST", body: {} }); } catch (e) {}
-    location.href = "/login.html";
+    </button>
+    <div class="ub-menu" id="ubMenu" hidden>
+      <button type="button" data-ub="switch">
+        <span class="ubm-t">切换账号</span>
+        <span class="ubm-s">用另一个账号登录</span>
+      </button>
+      <button type="button" data-ub="logout">
+        <span class="ubm-t">退出登录</span>
+        <span class="ubm-s">结束当前会话</span>
+      </button>
+    </div>`;
+  bindUserMenu();
+}
+
+/* 侧栏底部账号菜单：点右侧按钮弹出「切换账号 / 退出登录」。
+   两者都清掉服务端会话后回登录页（登录页直接用新账号覆盖即可）。 */
+let _ubDocBound = false;
+function bindUserMenu() {
+  const menu = $("#ubMenu");
+  const btn = $("#btnLogout");
+  if (!menu || !btn) return;
+  const close = () => { menu.hidden = true; };
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    menu.hidden = !menu.hidden;
   });
+  $$("[data-ub]", menu).forEach((el) => el.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    close();
+    try { await api("/api/auth/logout", { method: "POST", body: {} }); } catch (e) { /* 忽略 */ }
+    location.href = "/login.html";
+  }));
+  if (!_ubDocBound) {
+    _ubDocBound = true;
+    document.addEventListener("click", () => {
+      const m = $("#ubMenu");
+      if (m && !m.hidden) m.hidden = true;
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      const m = $("#ubMenu");
+      if (m && !m.hidden) m.hidden = true;
+    });
+  }
 }
 
 const TITLES = {
@@ -296,6 +633,8 @@ async function boot() {
   }
   renderNav();
   renderUserBox();
+  const bell = $("#notifBell");
+  if (bell) bell.addEventListener("click", toggleNotifPanel);
   try {
     const r = await api("/api/dashboard");
     state.dash = r.data;
@@ -304,5 +643,8 @@ async function boot() {
     toast(e.message, "error");
   }
   go("dashboard");
+  // 消息中心：登录后拉一次（有未读的入库通知就弹流光横幅），之后定时轮询
+  await loadNotifications({ popup: true });
+  startNotifPolling();
 }
 

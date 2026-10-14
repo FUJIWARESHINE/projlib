@@ -141,6 +141,216 @@ def _prefix_fail(codes):
     return fail(f"请添加项目编号前缀（{shown}）", 400, codes=bad)
 
 
+# ------------------------------------------------------------ 消息中心（通知）
+# 触发规则见 db.py 里「消息中心 / 站内通知」一节。日志式写库，失败只记日志，
+# 绝不影响主流程（新增项目 / 改状态必须照常成功）。
+def _safe_notify(fn, *args, **kw):
+    try:
+        return fn(*args, **kw)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notify] 通知写入失败：{exc}", file=sys.stderr, flush=True)
+        return 0
+
+
+def _notify_project_added(ptype: str, code: str, name: str, created_by: int = 0) -> int:
+    """新增项目 → 通知全体普通账户。
+
+    库存项目只在消息中心留未读（不弹横幅）；真实 / 加急 / 返修会弹「流光横幅」。
+    """
+    label = db.TYPE_NAME.get(ptype, ptype)
+    popup = ptype != "stock"
+    return db.add_notification(
+        db.NOTIF_PROJECT_IN, db.ROLE_USER,
+        f"{code} 项目已入库，请查看",
+        f"{label}｜{name}" if name else label,
+        ptype=ptype, code=code, popup=popup, created_by=created_by)
+
+
+def _notify_import_created(created_items: list, created_by: int = 0) -> int:
+    """导入产生的新项目 → 按类型汇总成一条通知（避免一次几十条刷屏）。
+
+    单个编号时文案就是「A539 项目已入库，请查看」；多个时变成
+    「加急项目已入库 5 个，请查看」，编号清单放正文。
+    """
+    if not created_items:
+        return 0
+    by_type = {}
+    for it in created_items:
+        by_type.setdefault(it.get("ptype") or "", []).append(it)
+    rows = []
+    for ptype, items in by_type.items():
+        label = db.TYPE_NAME.get(ptype, ptype)
+        codes = [str(it.get("code") or "") for it in items if it.get("code")]
+        if len(codes) == 1:
+            title = f"{codes[0]} 项目已入库，请查看"
+        else:
+            title = f"{label}已入库 {len(items)} 个，请查看"
+        body = "、".join(codes[:15]) + ("…" if len(codes) > 15 else "")
+        rows.append({
+            "category": db.NOTIF_PROJECT_IN, "target_role": db.ROLE_USER,
+            "title": title, "body": body, "ptype": ptype,
+            "code": codes[0] if len(codes) == 1 else "",
+            "popup": ptype != "stock",      # 库存只进消息中心，不弹横幅
+            "created_by": created_by,
+        })
+    return db.add_notifications_bulk(rows)
+
+
+def _notify_after_import(result: dict, ctx) -> None:
+    """导入完成后按「新增项目」广播入库通知。
+
+    明细（created_items）从响应里摘掉，避免 /api/import/run 的返回体过大。
+    """
+    items = result.pop("created_items", None) or []
+    if not items:
+        return
+    created_by = int(((ctx or {}).get("user") or {}).get("id") or 0)
+    _safe_notify(_notify_import_created, items, created_by)
+
+
+def _notify_platform_done(before: dict, platform: str, value: str, user: dict) -> None:
+    """普通账户把某项目某平台勾成 ✅ → 通知全体管理员。
+
+    只有「操作者不是管理员」且「该平台确实从非 ✅ 变成 ✅」时才播报，避免：
+      · 管理员自己勾选也通知自己；
+      · 重复点选 ✅ 反复刷屏。
+    平台完成后若项目**所有被设计平台**都已完成，再补一条「已结项，请审核」。
+    """
+    if value != db.ST_DONE or not before:
+        return
+    if auth.is_admin(user):
+        return
+    if (before.get(platform) or "").strip() == db.ST_DONE:
+        return
+    uid = int((user or {}).get("id") or 0)
+    code = before.get("code") or ""
+    name = before.get("name") or ""
+    ptype = before.get("ptype") or ""
+    label = db.PLATFORM_LABEL.get(platform, platform)
+    type_label = db.TYPE_NAME.get(ptype, ptype)
+    _safe_notify(db.add_notification,
+                 db.NOTIF_PLATFORM_DONE, db.ROLE_ADMIN,
+                 f"{code}项目{label}平台已完成",
+                 f"{type_label}｜{name}" if name else type_label,
+                 ptype=ptype, code=code, platform=platform,
+                 project_id=int(before.get("id") or 0), created_by=uid)
+    after = db.get_project(int(before.get("id") or 0))
+    st = db.project_status(after) if after else None
+    if st and st["completed"]:
+        done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st["done"])
+        # ① 通知全体管理员：已结项，请审核
+        _safe_notify(db.add_notification,
+                     db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
+                     f"{code}项目已结项，请审核",
+                     f"{type_label}｜{name}｜完成平台：{done_labels}",
+                     ptype=ptype, code=code,
+                     project_id=int(before.get("id") or 0), created_by=uid)
+        # ② 生成/重置「待审核」记录，并弹窗提醒有审核权限的普通账户
+        _safe_notify(db.upsert_audit, ptype, code,
+                     int(before.get("id") or 0), name)
+        if db.has_auditor():
+            _safe_notify(db.add_notification,
+                         db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR,
+                         f"{code}项目已结项，请审核",
+                         f"{type_label}｜{name}｜完成平台：{done_labels}",
+                         ptype=ptype, code=code,
+                         project_id=int(before.get("id") or 0), popup=True,
+                         created_by=uid)
+
+
+def api_audits(query, _b, ctx=None):
+    """结项待审核清单。仅「有审核权限的普通账户」与管理员可看。"""
+    user = (ctx or {}).get("user") or {}
+    if not (user.get("can_audit") or auth.is_admin(user)):
+        return fail("没有审核权限", 403)
+    status = (query.get("status", ["pending"])[0] or "pending").strip()
+    if status not in ("pending", "done", "all"):
+        return fail("status 不合法", 400)
+    items = db.list_audits("" if status == "all" else status)
+    return ok({"items": items, "pending": db.count_audits("pending"),
+               "can_audit": bool(user.get("can_audit"))})
+
+
+def api_audit_done(_q, _b, aid, ctx=None):
+    """审核员复核完成 → 通知全体管理员「某某某已审核完成，请复审」。"""
+    user = (ctx or {}).get("user") or {}
+    if not (user.get("can_audit") or auth.is_admin(user)):
+        return fail("没有审核权限", 403)
+    if not db.get_audit(aid):
+        return fail("该审核记录不存在", 404)
+    done = db.complete_audit(aid, user)
+    if not done:
+        return fail("该项目已经审核过了", 409, audit=db.get_audit(aid))
+    who = user.get("display_name") or user.get("username") or "审核员"
+    # 事已办完 —— 把「我」那条「请审核」提醒收掉，别再挂在未读里、也别再弹横幅
+    _safe_notify(db.mark_notif_read_for_project,
+                 int(user.get("id") or 0), db.NOTIF_AUDIT_REQUEST,
+                 done["ptype"], done["code"])
+    _safe_notify(db.add_notification,
+                 db.NOTIF_AUDIT_DONE, db.ROLE_ADMIN,
+                 f"{done['code']}项目 {who}已审核完成，请复审",
+                 f"{done['type_label']}｜{done['name']}",
+                 ptype=done["ptype"], code=done["code"],
+                 project_id=done["project_id"], created_by=int(user.get("id") or 0))
+    return ok({"audit": done, "auditor": who})
+
+
+def api_notifications(query, _b, ctx=None):
+    """当前用户的消息中心数据：列表 + 未读数 + 待弹横幅。
+
+    ?unread=1 只取未读；?limit=N 限制条数。popups 恒为「未读且 popup=1」。
+    受众按角色取：管理员只看管理员消息；普通账户看全员消息；
+    有审核权限的普通账户再多看一份「结项待审核」。
+    """
+    user = (ctx or {}).get("user") or {}
+    uid = int(user.get("id") or 0)
+    roles = db.roles_for(user)
+    try:
+        limit = int(query.get("limit", ["200"])[0] or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    only_unread = query.get("unread", [""])[0] in ("1", "true", "yes")
+    items = db.list_notifications(uid, roles, limit=max(1, min(limit, 500)),
+                                  unread_only=only_unread)
+    return ok({
+        "items": items,
+        "unread": db.notif_unread_count(uid, roles),
+        "popups": db.notif_pending_popups(uid, roles),
+        "roles": roles,
+        "can_audit": bool(user.get("can_audit")),
+        # 有审核权限时带上「待我审核」清单，消息中心直接列出来
+        "audits": db.list_audits("pending", limit=50) if user.get("can_audit") else [],
+    })
+
+
+def api_notifications_read(_q, body, ctx=None):
+    """标记已读：{ids:[...]} 指定条目标记；{all:true} 全部标记。"""
+    user = (ctx or {}).get("user") or {}
+    uid = int(user.get("id") or 0)
+    roles = db.roles_for(user)
+    if body.get("all"):
+        db.mark_notifications_read(uid, None, roles)
+    else:
+        ids = body.get("ids") or []
+        if not isinstance(ids, list):
+            return fail("ids 参数不合法", 400)
+        db.mark_notifications_read(uid, ids, roles)
+    return ok({"unread": db.notif_unread_count(uid, roles)})
+
+
+def api_notifications_clear(_q, _b, ctx=None):
+    """清空「我」的消息中心。
+
+    通知是按受众标签广播的，「清空」只对当前用户隐藏（写 hidden=1 的已读记录），
+    别的账号照常能看到自己的消息；「待我审核」工作台不受影响。
+    """
+    user = (ctx or {}).get("user") or {}
+    uid = int(user.get("id") or 0)
+    roles = db.roles_for(user)
+    n = db.hide_notifications(uid, roles)
+    return ok({"cleared": n, "unread": db.notif_unread_count(uid, roles)})
+
+
 # ------------------------------------------------------------------ 业务
 def api_auth_status(_q, _b):
     """无需登录：告知前端可选的注册岗位。
@@ -216,14 +426,21 @@ def api_get_project(_q, _b, pid):
 _VALID_TYPES = {k for k, _ in db.TYPES}
 
 
-def api_create_project(_q, body):
+def api_create_project(_q, body, ctx=None):
     ptype = str(body.get("ptype") or "").strip()
     if ptype not in _VALID_TYPES:
         return fail("项目类型不合法", 400)
     try:
-        return ok({"id": db.upsert_project(body)})
+        pid = db.upsert_project(body)
     except Exception as exc:  # noqa: BLE001
         return fail(str(exc))
+    # 新增项目 → 通知全体普通账户（真实/加急/返修弹横幅，库存只进消息中心）
+    row = db.get_project(pid)
+    if row:
+        _safe_notify(_notify_project_added, row["ptype"], row["code"],
+                     row.get("name") or "",
+                     created_by=int(((ctx or {}).get("user") or {}).get("id") or 0))
+    return ok({"id": pid})
 
 
 def api_update_project(_q, body, pid):
@@ -251,9 +468,12 @@ def api_set_platform_status(_q, body, pid, ctx=None):
         return fail("状态值不合法", 400)
     if not auth.can_edit_platform(user, plat):
         return fail("没有该平台的填报权限", 403)
-    if not db.get_project(pid):
+    before = db.get_project(pid)
+    if not before:
         return fail("项目不存在", 404)
     db.update_project(pid, {plat: value})
+    # 普通账户把平台勾成 ✅ → 通知管理员（含「项目已结项，请审核」）
+    _notify_platform_done(before, plat, value, user)
     return ok({"platform": plat, "value": value})
 
 
@@ -291,7 +511,7 @@ def api_import_preview(_q, body):
     return ok({"sheets": parsed["sheets"], "by_type": by_type, "sample": sample})
 
 
-def api_import_run(_q, body):
+def api_import_run(_q, body, ctx=None):
     path = _save_upload(body)
     if isinstance(path, tuple):
         return path
@@ -315,10 +535,11 @@ def api_import_run(_q, body):
         _cleanup_upload(path)
     if not result.get("ok"):
         return fail(result.get("error") or "导入失败")
+    _notify_after_import(result, ctx)
     return ok(result)
 
 
-def api_import_path(_q, body):
+def api_import_path(_q, body, ctx=None):
     """直接按本机路径导入（无需上传）。"""
     path = (body.get("path") or "").strip().strip('"')
     if not path or not os.path.isfile(path):
@@ -329,6 +550,7 @@ def api_import_path(_q, body):
         return fail(f"导入失败：{exc}")
     if not result.get("ok"):
         return fail(result.get("error") or "导入失败")
+    _notify_after_import(result, ctx)
     return ok(result)
 
 
@@ -468,6 +690,9 @@ def api_create_user(_q, body):
                 display_name=body.get("display_name"),
                 platform=(body.get("platform") or "").strip(),
             )
+            if body.get("can_audit"):
+                auth.update_user(user["id"], can_audit=True)
+                user = auth.get_user(user["id"])
         return ok({"user": user})
     except Exception as exc:  # noqa: BLE001
         return fail(str(exc))
@@ -487,6 +712,8 @@ def api_update_user(_q, body, uid):
             fields["platform"] = (body.get("platform") or "").strip()
         if "active" in body:
             fields["active"] = bool(body["active"])
+        if "can_audit" in body:
+            fields["can_audit"] = bool(body["can_audit"])
         if fields:
             auth.update_user(uid, **fields)
         return ok({"user": auth.get_user(uid)})
@@ -940,6 +1167,13 @@ ROUTES = [
     ("GET", re.compile(r"^/api/worklogs/summary$"), api_worklog_summary),
     ("PUT", re.compile(r"^/api/worklogs/(\d+)$"), api_worklog_update),
     ("DELETE", re.compile(r"^/api/worklogs/(\d+)$"), api_worklog_delete),
+    # ---- 消息中心（所有登录用户可用；按角色广播 + 各人各自的已读状态）
+    ("GET", re.compile(r"^/api/notifications$"), api_notifications),
+    ("POST", re.compile(r"^/api/notifications/read$"), api_notifications_read),
+    ("POST", re.compile(r"^/api/notifications/clear$"), api_notifications_clear),
+    # ---- 结项审核（有审核权限的普通账户；管理员也能看）
+    ("GET", re.compile(r"^/api/audits$"), api_audits),
+    ("POST", re.compile(r"^/api/audits/(\d+)/done$"), api_audit_done),
     ("POST", re.compile(r"^/api/system/open$"), api_open),
     ("GET", re.compile(r"^/api/system/data-dir$"), api_open_data_dir),
     ("GET", re.compile(r"^/api/system/download$"), api_download),
@@ -957,6 +1191,9 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_month_delete_entry,
              api_month_export,
              api_set_platform_status,
+             api_create_project, api_import_run, api_import_path,
+             api_notifications, api_notifications_read, api_notifications_clear,
+             api_audits, api_audit_done,
              api_worklogs_list, api_worklog_create, api_worklog_update,
              api_worklog_delete, api_worklog_summary}
 
