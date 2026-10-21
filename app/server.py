@@ -419,6 +419,17 @@ def api_broadcast_create(_q, body, ctx=None):
     return ok(item)
 
 
+def api_broadcast_reads(_q, _b, bid, ctx=None):
+    """管理员：某条通告的已读明细（谁看过 / 谁还没看）。"""
+    user = (ctx or {}).get("user") or {}
+    if not auth.is_admin(user):
+        return fail("需要管理员权限", 403)
+    item = db.broadcast_receipts(bid)
+    if not item:
+        return fail("通告不存在或已被撤回", 404)
+    return ok(item)
+
+
 def api_broadcast_delete(_q, _b, bid, ctx=None):
     """撤回通告：从所有接收者的消息中心消失（连同已读记录一起删掉）。"""
     user = (ctx or {}).get("user") or {}
@@ -1259,6 +1270,7 @@ ROUTES = [
     # ---- 全服通告（仅管理员：发布 / 查看已发布 / 撤回）
     ("GET", re.compile(r"^/api/broadcasts$"), api_broadcasts),
     ("POST", re.compile(r"^/api/broadcasts$"), api_broadcast_create),
+    ("GET", re.compile(r"^/api/broadcasts/(\d+)/reads$"), api_broadcast_reads),
     ("DELETE", re.compile(r"^/api/broadcasts/(\d+)$"), api_broadcast_delete),
     ("POST", re.compile(r"^/api/system/open$"), api_open),
     ("GET", re.compile(r"^/api/system/data-dir$"), api_open_data_dir),
@@ -1280,7 +1292,8 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_create_project, api_update_project, api_import_run, api_import_path,
              api_notifications, api_notifications_read, api_notifications_clear,
              api_audits, api_audit_done,
-             api_broadcasts, api_broadcast_create, api_broadcast_delete,
+             api_broadcasts, api_broadcast_create, api_broadcast_reads,
+             api_broadcast_delete,
              api_worklogs_list, api_worklog_create, api_worklog_update,
              api_worklog_delete, api_worklog_summary}
 
@@ -1361,6 +1374,7 @@ ADMIN_KEY_SET = {
     ("/api/system/open", "POST"), ("/api/system/data-dir", "GET"),
     # 全服通告：发布 / 查看已发布 / 撤回，都只给管理员
     ("/api/broadcasts", "GET"), ("/api/broadcasts", "POST"),
+    ("/api/broadcasts/*/reads", "GET"),
     ("/api/broadcasts/*", "DELETE"),
 }
 

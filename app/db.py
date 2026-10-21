@@ -1754,6 +1754,63 @@ def list_broadcasts(limit: int = 100) -> list:
     return out
 
 
+def broadcast_receipts(bid: int):
+    """某条全服通告的送达明细：谁看过（含时间）、谁还没看。
+
+    受众口径与 broadcast_audience() 完全一致 —— **启用中的普通账户**（role='user'），
+    岗位命中 target_platform（空 = 全体成员）。管理员不算受众（通告是发给成员干活的）。
+
+    已读判定 = notification_reads.read_at 非空，与 list_broadcasts 的计数口径一致。
+    ⚠️ hidden=1 的记录是「清空消息中心」时被顺带标成已读的（见 hide_notifications），
+    并不代表他点开看过 —— 单独标成 cleared 让管理员自己判断，不改变已读/未读的划分。
+    """
+    bid = int(bid or 0)
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM notifications WHERE id=?", (bid,)).fetchone()
+        if not row or (row["category"] or "") != NOTIF_BROADCAST:
+            return None
+        item = _notif_public(dict(row))
+        keys = [k for k in str(item["target_platform"]).split(",") if k]
+        sql = ("SELECT u.id, u.username, u.display_name, u.platform, "
+               "       rd.read_at, COALESCE(rd.hidden,0) AS hidden "
+               "FROM users u "
+               "LEFT JOIN notification_reads rd "
+               "       ON rd.notification_id=? AND rd.user_id=u.id "
+               "WHERE u.role=? AND u.active=1")
+        args = [bid, ROLE_USER]
+        if keys:
+            sql += f" AND u.platform IN ({','.join('?' * len(keys))})"
+            args += keys
+        rows = conn.execute(sql, args).fetchall()
+
+    order = {k: i for i, k in enumerate(BROADCAST_PLATFORM_KEYS)}
+    people = []
+    for r in rows:
+        d = dict(r)
+        read_at = d.get("read_at") or ""
+        plat = d.get("platform") or ""
+        people.append({
+            "id": int(d["id"]),
+            "username": d["username"],
+            "display_name": d.get("display_name") or d["username"],
+            "platform": plat,
+            "platform_label": SIGNUP_LABEL.get(plat, "全部平台"),
+            "read": bool(read_at),
+            "read_at": read_at,
+            "cleared": bool(read_at) and bool(d.get("hidden")),
+        })
+    # 未读在前（管理员最关心「还差谁」），同组内按岗位顺序、再按账号 id
+    people.sort(key=lambda p: (0 if not p["read"] else 1,
+                               order.get(p["platform"], 99), p["id"]))
+    read_n = sum(1 for p in people if p["read"])
+    item["users"] = people
+    item["audience"] = len(people)
+    item["read_count"] = read_n
+    item["unread_count"] = len(people) - read_n
+    item["cleared_count"] = sum(1 for p in people if p["cleared"])
+    return item
+
+
 def delete_broadcast(bid: int) -> bool:
     """撤回通告：连同已读记录一起删掉（广播类没有 per-user 行，直接删干净）。"""
     bid = int(bid or 0)

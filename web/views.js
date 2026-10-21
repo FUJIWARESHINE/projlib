@@ -315,9 +315,16 @@ function bindColResize(table, C) {
 VIEWS.browse = async (root) => {
   const B = state.browse;
   const admin = isAdmin();
+  let canAudit = admin || !!(state.me && state.me.can_audit);
   const types = await loadTypes();
   const C = loadColW();
   const cols = browseCols();
+  // 待审核统计：管理员与开了审核权限的账号才拉（没权限会 403，静默忽略）
+  let auditItems = [];
+  if (canAudit) {
+    try { auditItems = (await api("/api/audits?status=pending")).data.items || []; }
+    catch (e) { canAudit = false; }
+  }
   const platOpts = [["", "全部平台"], ["cell", "细胞"], ["mol", "分子"], ["path", "病理"], ["animal", "动物"]];
 
   root.innerHTML = `
@@ -354,6 +361,9 @@ VIEWS.browse = async (root) => {
           <option value="desc"${B.order === "desc" ? " selected" : ""}>倒序</option>
         </select>
         <span class="spacer"></span>
+        ${canAudit ? `<button class="btn btn-sm audit-entry${auditItems.length ? "" : " zero"}" id="btnAudits"
+          title="项目所有被设计平台都完成后产生审核单；点开查看全部待审核项目">
+          <span class="aud-dot"></span>待审核<b id="auditCnt">${auditItems.length}</b></button>` : ""}
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
         ${admin ? `
           <button class="btn btn-ghost btn-sm" id="btnExportAll">导出整库</button>
@@ -496,6 +506,9 @@ VIEWS.browse = async (root) => {
     if (t) fitCols(t, C);
   }, 140);
   window.addEventListener("resize", B._onResize);
+  if (canAudit) {
+    $("#btnAudits").addEventListener("click", () => pendingAuditsDialog());
+  }
   if (admin) {
     $("#btnNew").addEventListener("click", () => editProject(null, load));
     $("#btnExportAll").addEventListener("click", async () => {
@@ -512,6 +525,80 @@ VIEWS.browse = async (root) => {
 
   await load();
 };
+
+/* ------------------------------------------------ 待审核项目（项目库模块入口） */
+/* 项目所有被设计平台都勾成 ✅ 时，后端会自动落一条 project_audits(pending)。
+   入口只给「管理员」和「开了审核权限的账号」显示（GET /api/audits 同口径，403 就藏起来）。
+   审核完成复用 POST /api/audits/<id>/done，与消息中心里的按钮是同一套逻辑。 */
+function auditRowHtml(a) {
+  return `<div class="aud-row" data-aid="${a.id}">
+    <div class="aud-main">
+      <div class="aud-title">${typePill(a.ptype)}<b class="aud-code aud-jump" data-aud-jump="${esc(a.code)}"
+        title="在项目库里查看这个项目">${esc(a.code)}</b>
+        <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span></div>
+      <div class="aud-sub">结项时间 ${esc(notifTime(a.created_at)) || "—"} · 已全部平台完成，待复核</div>
+    </div>
+    <button class="btn btn-green btn-sm" data-aud="${a.id}">审核完成</button>
+  </div>`;
+}
+
+async function pendingAuditsDialog() {
+  let items = [];
+  const fetchAudits = async () => {
+    items = (await api("/api/audits?status=pending")).data.items || [];
+    return items;
+  };
+  try { await fetchAudits(); } catch (e) { return toast(e.message, "error"); }
+
+  openModal({
+    title: "待审核项目",
+    body: '<div id="audWrap"></div>',
+    footer: '<button class="btn btn-ghost btn-sm" id="audRefresh">刷新</button>'
+      + '<button class="btn btn-primary btn-sm" data-close>关闭</button>',
+    onMount: (root) => {
+      const wrap = $("#audWrap", root);
+      const syncEntry = () => {
+        const btn = $("#btnAudits"), cnt = $("#auditCnt");
+        if (cnt) cnt.textContent = items.length;
+        if (btn) btn.classList.toggle("zero", !items.length);
+      };
+      const paint = () => {
+        wrap.innerHTML = `
+          <div class="aud-head">当前共 <b>${items.length}</b> 个待审核项目${items.length
+            ? "，复核无误后点「审核完成」，管理员会收到复审提醒。" : "。"}</div>
+          <div class="aud-list">${items.length ? items.map(auditRowHtml).join("")
+            : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>`;
+        syncEntry();
+        // 点编号 → 关弹窗并在项目库里搜这个编号（审核前先核对项目内容）
+        $$("[data-aud-jump]", wrap).forEach((el) => el.addEventListener("click", () => {
+          const code = el.dataset.audJump || "";
+          closeModal();
+          state.browse.search = code;
+          state.browse.page = 1;
+          go("browse");
+        }));
+        $$("[data-aud]", wrap).forEach((b) => b.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          try { await api("/api/audits/" + btn.dataset.aud + "/done", { method: "POST", body: {} }); }
+          catch (e) { btn.disabled = false; return toast(e.message, "error"); }
+          toast("已审核完成，已通知管理员复审");
+          try { await fetchAudits(); } catch (e) { /* 拉不到就保留旧列表 */ }
+          paint();
+          loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标
+        }));
+      };
+      paint();
+      $("#audRefresh", root).addEventListener("click", async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        try { await fetchAudits(); paint(); } catch (e) { toast(e.message, "error"); }
+        btn.disabled = false;
+      });
+    },
+  });
+}
 
 function debounce(fn, ms) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
@@ -1596,6 +1683,7 @@ function bcAudienceHtml(chips, selected) {
 function bcItemHtml(it) {
   const aud = it.audience || 0;
   const rd = it.read_count || 0;
+  const un = Math.max(0, aud - rd);
   const full = aud > 0 && rd >= aud;
   return `<div class="bc-item" data-bid="${it.id}">
     <div class="bc-item-main">
@@ -1603,7 +1691,10 @@ function bcItemHtml(it) {
       ${it.body ? `<div class="bc-item-body">${esc(it.body)}</div>` : ""}
       <div class="bc-item-meta">
         <span class="bc-to">接收：${esc(it.target_platform_label || "全体成员")}</span>
-        <span class="bc-rate${full ? " ok" : ""}">已读 ${rd}/${aud}</span>
+        <button type="button" class="bc-rate bc-rate-btn${full ? " ok" : ""}"
+                data-bc-reads="${it.id}"${aud ? "" : " disabled"}
+                title="点开查看谁看了、谁还没看">已读 ${rd}/${aud}${
+          aud && un ? ` · 未读 ${un}` : ""}<i class="bc-caret">›</i></button>
         ${it.popup ? '<span class="bc-rate">弹窗提醒</span>' : '<span class="bc-rate">仅消息中心</span>'}
         <span>${esc(notifTime(it.created_at))}</span>
       </div>
@@ -1612,6 +1703,102 @@ function bcItemHtml(it) {
       <button class="btn btn-danger btn-sm" data-bc-del="${it.id}">撤回</button>
     </div>
   </div>`;
+}
+
+/* 已读明细弹窗：谁看过（含时间）、谁还没看。
+   ⚠️ 已读口径 = notification_reads.read_at 非空，与列表上的「已读 x/y」完全一致；
+   hidden=1（清空消息中心时顺带标的）单独标注，不混进「真的点开看过」。 */
+const RCPT_TABS = [
+  { key: "unread", label: "未读" },
+  { key: "read", label: "已读" },
+  { key: "all", label: "全部" },
+];
+
+function rcptRowHtml(p) {
+  // ⚠️ 只显示姓名，不显示账号：存储层会把「没填姓名」的账号兜底成登录名，
+  // 所以先用 noNameOf() 判掉，否则等于把账号名当姓名显示出来了。
+  const noName = noNameOf(p);
+  const initial = noName ? "?" : String(p.display_name).trim().slice(0, 1);
+  return `<div class="rcpt-row${p.read ? " is-read" : ""}">
+    <div class="rcpt-av${noName ? " noname" : ""}">${esc(initial || "?")}</div>
+    <div class="rcpt-who">
+      <b${noName ? ' class="rcpt-noname"' : ""}>${noName ? "未填姓名" : esc(p.display_name)}</b>
+      <span>${esc(p.platform_label || "全部平台")}</span>
+    </div>
+    <div class="rcpt-st">
+      ${p.read
+        ? `<span class="pill rcpt-ok">已读</span>
+           <em>${esc(notifTime(p.read_at))}${p.cleared ? '<i class="rcpt-note">清空时标记</i>' : ""}</em>`
+        : '<span class="pill rcpt-no">未读</span>'}
+    </div>
+  </div>`;
+}
+
+function rcptBodyHtml(d, tab) {
+  const people = d.users || [];
+  const rd = people.filter((p) => p.read);
+  const un = people.filter((p) => !p.read);
+  const cleared = people.filter((p) => p.cleared).length;
+  const picked = tab === "unread" ? un : (tab === "read" ? rd : people);
+  const countOf = { unread: un.length, read: rd.length, all: people.length };
+  const empty = !people.length
+    ? "这条通告当前没有可接收的成员（账号已停用或该岗位没人）"
+    : (tab === "unread" ? "全部成员都已读 ✅" : "这个分组里还没有人");
+  return `
+    <div class="rcpt-top">
+      <div class="rcpt-title">${esc(d.title)}</div>
+      <div class="rcpt-sub">接收：${esc(d.target_platform_label || "全体成员")} · 发布于 ${esc(notifTime(d.created_at))}</div>
+    </div>
+    <div class="rcpt-stats">
+      <div class="rcpt-stat no"><b>${un.length}</b><span>未读</span></div>
+      <div class="rcpt-stat ok"><b>${rd.length}</b><span>已读</span></div>
+      <div class="rcpt-stat"><b>${people.length}</b><span>受众</span></div>
+      ${cleared ? `<div class="rcpt-stat warn"><b>${cleared}</b><span>清空时标已读</span></div>` : ""}
+    </div>
+    ${cleared ? `<div class="rcpt-tip">其中 ${cleared} 人是在「清空消息中心」时被顺带标成已读的，
+      不代表真的点开看过这条通告。</div>` : ""}
+    <div class="rcpt-tabs" id="rcptTabs">
+      ${RCPT_TABS.map((t) => `<button type="button" class="rcpt-tab${t.key === tab ? " on" : ""}"
+        data-rcpt-tab="${t.key}">${t.label}<b>${countOf[t.key]}</b></button>`).join("")}
+    </div>
+    <div class="rcpt-list">
+      ${picked.length ? picked.map(rcptRowHtml).join("")
+        : `<div class="notif-empty">${esc(empty)}</div>`}
+    </div>`;
+}
+
+async function openBroadcastReceipts(bid) {
+  let d;
+  try { d = (await api("/api/broadcasts/" + bid + "/reads")).data; }
+  catch (e) { return toast(e.message, "error"); }
+  let tab = "unread";                    // 默认先看「还差谁」
+  if (!(d.users || []).some((p) => !p.read)) tab = "read";
+
+  openModal({
+    title: "已读明细",
+    body: '<div class="rcpt" id="rcptWrap"></div>',
+    footer: '<button class="btn btn-ghost btn-sm" id="rcptRefresh">刷新</button>'
+      + '<button class="btn btn-primary btn-sm" data-close>关闭</button>',
+    onMount: (root) => {
+      const wrap = $("#rcptWrap", root);
+      const paint = () => {
+        wrap.innerHTML = rcptBodyHtml(d, tab);
+        $$("[data-rcpt-tab]", wrap).forEach((b) => b.addEventListener("click", () => {
+          tab = b.dataset.rcptTab;
+          paint();
+        }));
+      };
+      paint();
+      $("#rcptRefresh", root).addEventListener("click", async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        try { d = (await api("/api/broadcasts/" + bid + "/reads")).data; }
+        catch (e) { toast(e.message, "error"); }
+        btn.disabled = false;
+        paint();
+      });
+    },
+  });
 }
 
 async function loadNoticePage(root) {
@@ -1720,6 +1907,10 @@ async function loadNoticePage(root) {
     toast(`已发布，${res.audience || 0} 名成员会收到提醒`);
     await loadNoticePage(root);
   });
+
+  $$("[data-bc-reads]", root).forEach((b) => b.addEventListener("click", () => {
+    openBroadcastReceipts(Number(b.dataset.bcReads));
+  }));
 
   $$("[data-bc-del]", root).forEach((b) => b.addEventListener("click", async () => {
     const bid = Number(b.dataset.bcDel);
