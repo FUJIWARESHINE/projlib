@@ -277,8 +277,11 @@ function notifItemHtml(n) {
   //   这条永远按未读渲染（右侧红点不灭）、右上角角标也一直计数，
   //   只有点了「审核完成」才取消 —— 消息多的时候不至于漏掉待审核项目。
   const unread = !n.read || !!n.sticky;
+  // 同一项目可能有多轮「请审核」提醒：旧的那轮已被新一轮替代，别再给按钮
   const act = isAudit
-    ? (n.audit_pending
+    ? (n.superseded
+        ? `<div class="ni-act"><span class="ni-done">↩︎ 已被新一轮提醒替代</span></div>`
+        : n.audit_pending
         ? `<div class="ni-act"><button class="btn btn-green btn-sm" data-audit="${n.audit_id}">审核完成</button>
              <span class="ni-hint">复核无误后点这里；<b>没点之前红点不会消</b>，以免漏审</span></div>`
         : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`)

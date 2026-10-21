@@ -1392,6 +1392,8 @@ def _notif_public(row: dict, read: bool = False) -> dict:
         "audit_pending": False,
         # sticky = 「粘住不放」：项目还没审核完成时，这条提醒永远按未读渲染、角标也照常计数
         "sticky": False,
+        # superseded = 同一项目更新的那轮提醒已经来了，这条是上一轮的历史记录
+        "superseded": False,
     }
 
 
@@ -1401,15 +1403,29 @@ def _annotate_audits(items: list) -> list:
     ★ sticky（待审核项目的「请审核」提醒）：点过、点过全部已读、清空过都不算数，
     前端仍按未读渲染，角标也继续计数 —— 只有点「审核完成」才取消。
     目的：消息多的时候不遗漏待审核项目。
+    ★ 同一项目可能有多轮提醒（审核完成后又被修改、重新结项 → 又发一条）。
+      只让**最新那条**挂当前审核单与 sticky，旧的那条标 superseded ——
+      否则旧消息会被新一轮的 pending 单重新点亮，看起来像「重复待办」。
     """
-    keys = {(x["ptype"], x["code"]) for x in items if x.get("category") == NOTIF_AUDIT_REQUEST}
-    if not keys:
+    latest = {}
+    for x in items:
+        if x.get("category") != NOTIF_AUDIT_REQUEST:
+            continue
+        k = (x["ptype"], x["code"])
+        if k not in latest or x["id"] > latest[k]:
+            latest[k] = x["id"]
+    if not latest:
         return items
     amap = audit_map()
     for x in items:
         if x.get("category") != NOTIF_AUDIT_REQUEST:
             continue
-        a = amap.get((x["ptype"], x["code"]))
+        k = (x["ptype"], x["code"])
+        if x["id"] != latest.get(k):
+            # 上一轮的提醒：那一轮已经审过了，别再拿新单点亮它
+            x["superseded"] = True
+            continue
+        a = amap.get(k)
         if a:
             x["audit_id"] = a["id"]
             x["audit_pending"] = a["status"] == "pending"
@@ -1526,12 +1542,17 @@ def list_notifications(user_id: int, roles, limit: int = 200,
 def _sticky_audit_cond(alias: str) -> str:
     """「待审核提醒恒算未读」的 SQL 条件（alias = notifications 表别名）。
 
-    条件成立 ⇔ 这条是 audit_request，且它对应的 project_audits 还是 pending。
-    用在未读计数里，让红点一直亮到「审核完成」为止。
+    条件成立 ⇔ 这条是 audit_request、它对应的 project_audits 还是 pending，
+    并且它**是该最新一轮**的提醒 —— 同一项目重新结项/复核后会有新的提醒，
+    旧的那条不能再跟着新单一起变红（否则红点虚高、像重复待办）。
+    用在未读计数与「清空消息中心」里，让红点一直亮到「审核完成」为止。
     """
     return (f"({alias}.category=? AND EXISTS(SELECT 1 FROM project_audits a "
             f"WHERE a.status='pending' AND a.ptype={alias}.ptype "
-            f"AND UPPER(a.code)=UPPER({alias}.code)))")
+            f"AND UPPER(a.code)=UPPER({alias}.code)) "
+            f"AND {alias}.id=(SELECT MAX(n2.id) FROM notifications n2 "
+            f"  WHERE n2.category={alias}.category AND n2.ptype={alias}.ptype "
+            f"  AND UPPER(n2.code)=UPPER({alias}.code)))")
 
 
 def notif_unread_count(user_id: int, roles, platform: str = "",
@@ -1577,8 +1598,9 @@ def notif_pending_popups(user_id: int, roles, limit: int = 20,
     rows = list_notifications(user_id, roles, limit=limit,
                               unread_only=True, popup_only=True, platform=platform)
     return [x for x in rows
-            if not (x.get("category") == NOTIF_AUDIT_REQUEST and x.get("audit_id")
-                    and not x.get("audit_pending"))]
+            if not x.get("superseded")
+            and not (x.get("category") == NOTIF_AUDIT_REQUEST and x.get("audit_id")
+                     and not x.get("audit_pending"))]
 
 
 def mark_notif_read_for_project(user_id: int, category: str, ptype: str,
@@ -1833,7 +1855,8 @@ def _audit_public(row: dict) -> dict:
         "name": row.get("name") or "",
         "project_id": int(row.get("project_id") or 0),
         "status": row.get("status") or "pending",
-        "status_name": {"pending": "待审核", "done": "已审核"}.get(row.get("status"), "待审核"),
+        "status_name": {"pending": "待审核", "done": "已审核",
+                        "void": "已撤回（项目退回未完成）"}.get(row.get("status"), "待审核"),
         "auditor_id": int(row.get("auditor_id") or 0),
         "auditor_name": row.get("auditor_name") or "",
         "created_at": row.get("created_at") or "",
@@ -1870,6 +1893,15 @@ def get_audit(aid: int):
     return _audit_public(dict(row)) if row else None
 
 
+def get_audit_by(ptype: str, code: str):
+    """按 (类型, 编号) 取审核单（编号忽略大小写）。没有则 None。"""
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_audits WHERE ptype=? AND UPPER(code)=UPPER(?)",
+            ((ptype or "").strip(), str(code or "").strip())).fetchone()
+    return _audit_public(dict(row)) if row else None
+
+
 def audit_map() -> dict:
     """{(ptype, code): {id, status, auditor_name}} 一次取全，供通知列表打标。"""
     with tx() as conn:
@@ -1888,6 +1920,20 @@ def list_audits(status: str = "pending", limit: int = 200) -> list:
             f"SELECT * FROM project_audits {where} ORDER BY id DESC LIMIT ?",
             args + [int(limit or 200)]).fetchall()
     return [_audit_public(dict(r)) for r in rows]
+
+
+def void_audit(ptype: str, code: str) -> int:
+    """撤回待审核单：项目退出「已完成」状态（取消勾选 / 复核不通过退回返工）时用。
+
+    只动 pending；已审核（done）的历史记录保留。否则「待审核」里会一直挂着一个
+    根本还没做完的项目，审核员点「审核完成」也说不通。
+    """
+    with tx() as conn:
+        cur = conn.execute(
+            "UPDATE project_audits SET status='void', reviewed_at=? "
+            "WHERE ptype=? AND UPPER(code)=UPPER(?) AND status='pending'",
+            (_now(), (ptype or "").strip(), str(code or "").strip()))
+        return int(cur.rowcount or 0)
 
 
 def count_audits(status: str = "pending") -> int:

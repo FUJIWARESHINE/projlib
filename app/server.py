@@ -209,19 +209,45 @@ def _notify_after_import(result: dict, ctx) -> None:
     _safe_notify(_notify_import_created, items, created_by)
 
 
+def _audit_content_changed(before: dict, after: dict) -> bool:
+    """项目「需要重新审核的内容」是否有变化。
+
+    只比业务内容（名称/平台状态/备注/报价/类型编号），不看 updated_at ——
+    前端编辑弹窗「原样保存」也会写 updated_at，拿它判断会天天重开审核。
+    """
+    if not before or not after:
+        return False
+    if (str(before.get("ptype") or "") != str(after.get("ptype") or "")
+            or str(before.get("code") or "").strip().upper()
+            != str(after.get("code") or "").strip().upper()):
+        return True
+    for k in ("name", "cell", "mol", "path", "animal", "extra",
+              "audit_sun", "audit_xu", "send_date", "note"):
+        if str(before.get(k) or "").strip() != str(after.get(k) or "").strip():
+            return True
+    try:
+        return round(float(before.get("price") or 0), 2) != round(float(after.get("price") or 0), 2)
+    except (TypeError, ValueError):
+        return False
+
+
 def _notify_status_change(before: dict, after: dict, user: dict) -> None:
     """项目平台状态写入后的通知分发（项目库列表内联点勾 / 编辑弹窗共用）。
 
     ① 平台完成（非 ✅ → ✅）：通知全体管理员。
        **仅普通账户操作时播报** —— 管理员在项目库里替人勾选时不给自己刷屏。
-    ② 项目结项（未结项 → 已结项）：生成「待审核」单 + 通知全体管理员与全体审核员。
+    ② 结项 / 复核：只要写入后项目处于「已完成」状态，就保证待审核单是 pending。
+       · 首次结项（未完成 → 完成）→ 建单 + 通知；
+       · 已审核过（单子 done）之后项目内容又被改动 → **重新开单**，通知文案写「请重新审核」；
+         这是「复核」的正路 —— 早期只认「未完成 → 完成」这一次状态迁移，
+         于是复核阶段在编辑弹窗里改平台/改报价（完成状态没翻转）就静默丢掉，
+         待审核统计里始终没有这个项目，只有最早那条通知。
+       · 原样保存（内容没变）或已经 pending → 不动，避免重复刷单。
        **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要进审核流程。
-       （早期版本把这段一起塞在「操作者不是管理员就 return」后面，
-        结果管理员点勾时审核员既收不到消息、project_audits 也不落单，
-        「待我审核」始终是空的 —— 这就是「开审核的账户收不到待审核」的根因。）
     """
-    if not before or not after:
+    if after is None:
         return
+    before = before or {}
     uid = int((user or {}).get("id") or 0)
     pid = int(after.get("id") or 0)
     code = after.get("code") or ""
@@ -243,22 +269,35 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
                          ptype=ptype, code=code, platform=key,
                          project_id=pid, created_by=uid)
 
-    # ② 结项：只在「未结项 → 已结项」这一次迁移上触发，重复点 ✅ 不会重复建单
+    # ② 结项 / 复核：只认「写入后已完成」+「内容确实变过」
     st_before = db.project_status(before)
     st_after = db.project_status(after)
-    if st_before["completed"] or not st_after["completed"]:
+    if not st_after["completed"]:
+        # 复核不通过 / 取消勾选 → 项目退出完成态，撤掉它的待审核单，
+        # 否则审核员会看到一个还没做完的项目挂在「待审核」里
+        if st_before["completed"]:
+            _safe_notify(db.void_audit,
+                         before.get("ptype") or ptype, before.get("code") or code)
         return
+    if st_before["completed"] and not _audit_content_changed(before, after):
+        return
+    cur = db.get_audit_by(ptype, code)
+    if cur and cur.get("status") == "pending":
+        return                       # 已经在待审核里，别重复建单/刷通知
+    reopened = bool(cur)             # 有历史单（已审核）→ 这一轮是复核
+
     done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st_after["done"])
     body = f"{type_label}｜{name}｜完成平台：{done_labels}"
+    title = f"{code}项目{'内容已变更，请重新审核' if reopened else '已结项，请审核'}"
+    if reopened:
+        body += "｜复核：项目内容有变更，需再次审核"
     _safe_notify(db.add_notification,
-                 db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
-                 f"{code}项目已结项，请审核", body,
+                 db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN, title, body,
                  ptype=ptype, code=code, project_id=pid, created_by=uid)
     _safe_notify(db.upsert_audit, ptype, code, pid, name)
     if db.has_auditor():
         _safe_notify(db.add_notification,
-                     db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR,
-                     f"{code}项目已结项，请审核", body,
+                     db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR, title, body,
                      ptype=ptype, code=code, project_id=pid, popup=True,
                      created_by=uid)
 
@@ -529,6 +568,8 @@ def api_create_project(_q, body, ctx=None):
         _safe_notify(_notify_project_added, row["ptype"], row["code"],
                      row.get("name") or "",
                      created_by=int(((ctx or {}).get("user") or {}).get("id") or 0))
+        # 手工新增时就把所有平台填成 ✅ 的，一样要进结项审核
+        _notify_status_change({}, row, (ctx or {}).get("user") or {})
     return ok({"id": pid})
 
 
@@ -543,7 +584,15 @@ def api_update_project(_q, body, pid, ctx=None):
     db.update_project(pid, body)
     # 编辑弹窗里也能改平台状态（cell/mol/path/animal），
     # 这条路径以前完全不通知 —— 管理员整套平台改成 ✅ 后审核员收不到待审核。
-    _notify_status_change(before, db.get_project(pid), (ctx or {}).get("user") or {})
+    after = db.get_project(pid)
+    _notify_status_change(before, after, (ctx or {}).get("user") or {})
+    # 换了类型 / 编号（库存转加急、编号写错重改）：旧组若一条项目都不剩，
+    # 它的待审核单跟着作废，免得「待审核」里挂着一条已经改走的旧编号。
+    if after and (str(before.get("ptype") or "") != str(after.get("ptype") or "")
+                  or str(before.get("code") or "").strip().upper()
+                  != str(after.get("code") or "").strip().upper()):
+        if not db.find_by_codes(before.get("ptype") or "", [before.get("code") or ""]):
+            _safe_notify(db.void_audit, before.get("ptype") or "", before.get("code") or "")
     return ok(True)
 
 
