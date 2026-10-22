@@ -211,10 +211,17 @@ def _notify_after_import(result: dict, ctx) -> None:
 
 
 def _audit_content_changed(before: dict, after: dict) -> bool:
-    """项目「需要重新审核的内容」是否有变化。
+    """项目是否发生了**需要重新审核**的变更。
 
-    只比业务内容（名称/平台状态/备注/报价/类型编号），不看 updated_at ——
-    前端编辑弹窗「原样保存」也会写 updated_at，拿它判断会天天重开审核。
+    ★ 只认「平台完成情况」：cell / mol / path / animal 四列的值。
+      改发送日期、改项目名、改报价/备注/孙徐审核标记 一律**不算**变更，
+      不会再把已经审核完的项目重新拉回待审核。
+      （2026-10-22 用户反馈：项目已结项、审核也完成了，只改了个发送日期就又开
+      了一轮审核；口径收窄为「只有动平台完成情况才重审」。）
+    ★ 另外把「项目身份」（类型 ptype / 编号 code）也算变更 —— 换类型、改编号
+      等于换了一个项目，旧审核单本来就会作废，新编号下需要重新走一遍审核。
+    ★ 不看 updated_at —— 前端编辑弹窗「原样保存」也会写 updated_at，
+      拿它判断会天天重开审核。
     """
     if not before or not after:
         return False
@@ -222,14 +229,10 @@ def _audit_content_changed(before: dict, after: dict) -> bool:
             or str(before.get("code") or "").strip().upper()
             != str(after.get("code") or "").strip().upper()):
         return True
-    for k in ("name", "cell", "mol", "path", "animal", "extra",
-              "audit_sun", "audit_xu", "send_date", "note"):
-        if str(before.get(k) or "").strip() != str(after.get(k) or "").strip():
+    for key, _label in db.PLATFORMS:
+        if str(before.get(key) or "").strip() != str(after.get(key) or "").strip():
             return True
-    try:
-        return round(float(before.get("price") or 0), 2) != round(float(after.get("price") or 0), 2)
-    except (TypeError, ValueError):
-        return False
+    return False
 
 
 def _notify_status_change(before: dict, after: dict, user: dict) -> None:
@@ -237,13 +240,15 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
 
     ① 平台完成（非 ✅ → ✅）：通知全体管理员。
        **仅普通账户操作时播报** —— 管理员在项目库里替人勾选时不给自己刷屏。
-    ② 结项 / 复核：只要写入后项目处于「已完成」状态，就保证待审核单是 pending。
+    ② 结项 / 复核：写入后项目处于「已完成」状态，且**平台完成情况确实变了**，才建单。
        · 首次结项（未完成 → 完成）→ 建单 + 通知；
-       · 已审核过（单子 done）之后项目内容又被改动 → **重新开单**，通知文案写「请重新审核」；
+       · 已审核过（单子 done）之后又改了平台完成情况（cell/mol/path/animal 任一列）
+         → **重新开单**，通知文案写「请重新审核」；
          这是「复核」的正路 —— 早期只认「未完成 → 完成」这一次状态迁移，
-         于是复核阶段在编辑弹窗里改平台/改报价（完成状态没翻转）就静默丢掉，
+         于是复核阶段在编辑弹窗里改平台（完成状态没翻转）就静默丢掉，
          待审核统计里始终没有这个项目，只有最早那条通知。
-       · 原样保存（内容没变）或已经 pending → 不动，避免重复刷单。
+       · 只改发送日期 / 项目名 / 报价 / 备注 / 孙徐审核标记 → **不算变更，不重开审核**；
+         原样保存或已经 pending → 同样不动，避免重复刷单。
        **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要进审核流程。
     """
     if after is None:
