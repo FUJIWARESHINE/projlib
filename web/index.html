@@ -3,8 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>项目库统计程序</title>
 <link rel="icon" type="image/x-icon" href="favicon.ico">
+<!-- 主题要在样式表之前定下来，否则会先闪一下亮色再切到暗色 -->
+<script>
+(function () {
+  var t = "light";
+  try { if (localStorage.getItem("projlib.theme") === "dark") t = "dark"; } catch (e) {}
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -34,6 +44,15 @@
       </div>
       <div class="topbar-right">
         <div class="topbar-actions" id="topActions"></div>
+        <button class="icon-btn theme-btn" id="themeBtn" title="切换明亮 / 暗黑主题" aria-label="切换主题">
+          <svg class="i-moon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8z"/>
+          </svg>
+          <svg class="i-sun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4.2"/>
+            <path d="M12 2.2v2.2M12 19.6v2.2M4.2 12H2M22 12h-2.2M5.6 5.6L4.1 4.1M19.9 19.9l-1.5-1.5M18.4 5.6l1.5-1.5M4.1 19.9l1.5-1.5"/>
+          </svg>
+        </button>
         <div class="bell-wrap" id="bellWrap">
           <button class="bell" id="notifBell" title="消息中心" aria-label="消息中心">
             <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

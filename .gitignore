@@ -5,6 +5,8 @@ data/
 __pycache__/
 *.pyc
 .tmp-verify/
+.tmp-ui-verify/
+.venv-ui/
 .workbuddy/
 *.db
 *.log

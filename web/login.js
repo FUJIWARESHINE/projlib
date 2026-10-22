@@ -149,8 +149,35 @@ async function doSubmit(mode) {
   }
 }
 
+/* ------------------------------------------------ 主题（明亮 / 暗黑，默认明亮） */
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+function applyTheme(t) {
+  const next = t === "dark" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", next);
+  const btn = $("#themeBtn");
+  if (btn) btn.setAttribute("title", next === "dark" ? "切换到明亮主题" : "切换到暗黑主题");
+}
+function toggleTheme() {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  try { localStorage.setItem("projlib.theme", next); } catch (e) {}
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (typeof document.startViewTransition === "function" && !reduced) {
+    document.startViewTransition(() => applyTheme(next));
+  } else {
+    applyTheme(next);
+  }
+}
+function bindTheme() {
+  applyTheme(currentTheme());
+  const btn = $("#themeBtn");
+  if (btn) btn.addEventListener("click", toggleTheme);
+}
+
 /* ------------------------------------------------ 启动 */
 async function boot() {
+  bindTheme();
   $$(".login-tab").forEach((b) => b.addEventListener("click", () => {
     MODE = b.dataset.tab; render();
   }));

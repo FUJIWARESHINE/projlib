@@ -38,6 +38,38 @@ state.browse.order = loadPref("browse_order", "asc");
 state.browse.sort = loadPref("browse_sort", "code");
 state.browse.group = loadPref("browse_group", "type");
 
+/* ------------------------------------------------ 主题（明亮 / 暗黑）
+   默认明亮；用户手动切过就记在 localStorage["projlib.theme"]。
+   首屏的主题由 index.html 里的小脚本提前写好 data-theme，避免闪白。 */
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+function applyTheme(t) {
+  const next = t === "dark" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", next);
+  const btn = $("#themeBtn");
+  if (btn) btn.setAttribute("title", next === "dark" ? "切换到明亮主题" : "切换到暗黑主题");
+}
+function toggleTheme() {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  savePref("theme", next);
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Chromium 支持 View Transitions：整页做一次淡入揭示，接近 iOS 换外观的手感
+  if (typeof document.startViewTransition === "function" && !reduced) {
+    document.startViewTransition(() => applyTheme(next));
+  } else {
+    applyTheme(next);
+  }
+}
+function bindTheme() {
+  applyTheme(currentTheme());
+  const btn = $("#themeBtn");
+  if (btn && !btn.dataset.themeBound) {
+    btn.dataset.themeBound = "1";
+    btn.addEventListener("click", toggleTheme);
+  }
+}
+
 /* ------------------------------------------------ 脱敏展示 */
 /* 界面上不直接暴露用户本机的源文件名，改为「主名…扩展名」的模糊形式。
    "A-加急-返修-库存 信息更新.xlsx" -> "A-加急-返修-库存 信息更新…xlsx"
@@ -649,6 +681,10 @@ async function go(view) {
   view$.innerHTML = '<div class="loading">加载中…</div>';
   try {
     await VIEWS[view](view$);
+    // 视图落位动画：换页时重新触发一次（重新加类名才会重放）
+    view$.classList.remove("view-in");
+    void view$.offsetWidth;
+    view$.classList.add("view-in");
   } catch (e) {
     view$.innerHTML = `<div class="empty"><p>加载失败：${esc(e.message)}</p></div>`;
   }
@@ -663,6 +699,7 @@ async function loadTypes() {
 }
 
 async function boot() {
+  bindTheme();
   try {
     const me = await api("/api/auth/me");
     state.me = me.data.user;
