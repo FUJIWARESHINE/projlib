@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 .tmp-verify/
 .tmp-ui-verify/
+.tmp-bk-verify/
 .venv-ui/
 .workbuddy/
 *.db

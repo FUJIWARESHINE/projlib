@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 import auth
+import backup
 import db
 import export_excel
 import importer
@@ -1231,14 +1232,162 @@ def api_system_info(_q, _b):
 
 
 def api_backup(_q, _b):
-    os.makedirs(os.path.join(db.get_data_dir(), "backups"), exist_ok=True)
-    target = os.path.join(
-        db.get_data_dir(), "backups", f"projectlib_backup_{datetime.now():%Y%m%d_%H%M%S}.db"
-    )
-    with db.tx() as conn:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    shutil.copy2(db.get_db_path(), target)
-    return ok({"path": target})
+    """老的「备份数据库」入口（数据维护卡片用），现在走统一备份流程：
+    存到配置好的备份目录、按保留份数清理。"""
+    res = backup.run_backup(backup.TAG_MANUAL)
+    if not res.get("ok"):
+        return fail(res.get("error") or "备份失败")
+    return ok({
+        "path": os.path.join(res["dir"], res["name"]).replace("\\", "/"),
+        "name": res["name"],
+        "size": res.get("size", 0),
+        "removed": res.get("removed", []),
+    })
+
+
+# ---------------------------------------------------------------- 备份管理
+def api_backup_config(_q, _b):
+    return ok({
+        "config": backup.get_config(),
+        "status": backup.get_status(),
+        "items": backup.list_backups(),
+    })
+
+
+def api_backup_config_save(_q, body):
+    # 先验证目录再落库：否则用户收到「目录不可写」的错误，配置却已经存进去了，
+    # 之后每次自动备份都会静默失败 —— 这种「报错但生效一半」最坑人。
+    if "dir" in body:
+        okd, err = backup.ensure_dir(backup.resolve_dir_value(body.get("dir")))
+        if not okd:
+            return fail(err)
+    cfg = backup.save_config(body)
+    okd, err = backup.ensure_dir(cfg["dir_effective"])
+    if not okd:
+        return fail(err)
+    return ok({
+        "config": cfg,
+        "status": backup.get_status(),
+        "items": backup.list_backups(),
+    })
+
+
+def api_backup_run(_q, _b):
+    res = backup.run_backup(backup.TAG_MANUAL)
+    if not res.get("ok"):
+        return fail(res.get("error") or "备份失败")
+    return ok({
+        "name": res["name"], "dir": res["dir"],
+        "size": res.get("size", 0), "removed": res.get("removed", []),
+        "config": backup.get_config(),
+        "status": backup.get_status(),
+        "items": backup.list_backups(),
+    })
+
+
+def api_backup_restore(_q, body):
+    res = backup.restore(body.get("name") or "")
+    if not res.get("ok"):
+        return fail(res.get("error") or "恢复失败")
+    return ok({
+        "restored": res["restored"],
+        "safety_copy": res["safety_copy"],
+        "config": backup.get_config(),
+        "status": backup.get_status(),
+        "items": backup.list_backups(),
+    })
+
+
+def api_backup_delete(query, _b):
+    name = query.get("name", [""])[0]
+    if not backup.NAME_RE.match(name or ""):
+        return fail("备份文件名不合法")
+    path = os.path.join(backup.get_config()["dir_effective"], name)
+    if not os.path.isfile(path):
+        return fail("备份文件不存在", 404)
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return fail(f"删除失败：{exc}")
+    return ok({
+        "deleted": name,
+        "config": backup.get_config(),
+        "status": backup.get_status(),
+        "items": backup.list_backups(),
+    })
+
+
+def api_backup_download(query, _b):
+    name = query.get("name", [""])[0]
+    if not backup.NAME_RE.match(name or ""):
+        return fail("备份文件名不合法")
+    path = os.path.join(backup.get_config()["dir_effective"], name)
+    if not os.path.isfile(path):
+        return fail("备份文件不存在", 404)
+    with open(path, "rb") as f:
+        content = f.read()
+    return ("FILE", content, "application/x-sqlite3", name)
+
+
+def api_backup_browse(query, _b):
+    """服务端目录浏览（容器部署时没法弹系统文件夹选择框）。只返回目录，不读文件。"""
+    raw = (query.get("path", [""])[0] or "").strip()
+    cfg = backup.get_config()
+    path = os.path.abspath(os.path.expanduser(raw or cfg["dir_effective"]))
+    if not os.path.isdir(path):
+        return fail("目录不存在：" + path)
+    dirs = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                dirs.append({"name": e.name, "path": e.path})
+    except PermissionError:
+        return fail("没有权限读取该目录")
+    except OSError as exc:
+        return fail(f"读取目录失败：{exc}")
+    dirs.sort(key=lambda d: d["name"].lower())
+    parent = os.path.dirname(path)
+    if parent == path:
+        parent = ""
+    # 展示层统一正斜杠（容器是 /data/backups，Windows 也显示成 D:/x/y）
+    for d in dirs:
+        d["path"] = backup.posix_path(d["path"])
+    return ok({
+        "path": backup.posix_path(path),
+        "parent": backup.posix_path(parent),
+        "dirs": dirs[:800],
+        "writable": os.access(path, os.W_OK),
+        # 桌面（Windows exe）模式下前端会多给一个「系统选择框」按钮
+        "native": IS_WINDOWS,
+        "shortcuts": [
+            {"name": "默认备份目录", "path": backup.posix_path(cfg["dir_default"])},
+            {"name": "数据目录", "path": backup.posix_path(db.get_data_dir())},
+        ],
+    })
+
+
+def api_backup_pick_dir(_q, _b):
+    """桌面（Windows exe）模式：弹系统「选择文件夹」。容器里走 browse。"""
+    if not IS_WINDOWS:
+        return fail("当前为服务端部署，请用「浏览」选择容器内目录")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(title="选择数据库备份文件夹", mustexist=False)
+        root.destroy()
+        return ok({"path": path or ""})
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"选择文件夹失败：{exc}")
 
 
 def api_package(_q, _b):
@@ -1327,6 +1476,15 @@ ROUTES = [
     ("GET", re.compile(r"^/api/download$"), api_download),
     ("GET", re.compile(r"^/api/system/info$"), api_system_info),
     ("POST", re.compile(r"^/api/system/backup$"), api_backup),
+    # ---- 数据库备份（配置 / 手动 / 恢复 / 删除 / 下载 / 目录浏览）
+    ("GET", re.compile(r"^/api/backup$"), api_backup_config),
+    ("PUT", re.compile(r"^/api/backup$"), api_backup_config_save),
+    ("POST", re.compile(r"^/api/backup/run$"), api_backup_run),
+    ("POST", re.compile(r"^/api/backup/restore$"), api_backup_restore),
+    ("POST", re.compile(r"^/api/backup/pick-dir$"), api_backup_pick_dir),
+    ("DELETE", re.compile(r"^/api/backup/file$"), api_backup_delete),
+    ("GET", re.compile(r"^/api/backup/download$"), api_backup_download),
+    ("GET", re.compile(r"^/api/backup/browse$"), api_backup_browse),
     ("POST", re.compile(r"^/api/system/package$"), api_package),
     ("GET", re.compile(r"^/api/health$"), api_health),
 ]
@@ -1421,6 +1579,12 @@ ADMIN_KEY_SET = {
     ("/api/settings", "GET"), ("/api/settings", "PUT"),
     ("/api/system/info", "GET"),
     ("/api/system/open", "POST"), ("/api/system/data-dir", "GET"),
+    # 数据库备份：配置、手动备份、恢复、删除、下载、目录浏览，全部只给管理员
+    ("/api/backup", "GET"), ("/api/backup", "PUT"),
+    ("/api/backup/run", "POST"), ("/api/backup/restore", "POST"),
+    ("/api/backup/pick-dir", "POST"),
+    ("/api/backup/file", "DELETE"), ("/api/backup/download", "GET"),
+    ("/api/backup/browse", "GET"),
     # 全服通告：发布 / 查看已发布 / 撤回，都只给管理员
     ("/api/broadcasts", "GET"), ("/api/broadcasts", "POST"),
     ("/api/broadcasts/*/reads", "GET"),
@@ -1562,6 +1726,7 @@ class Handler(BaseHTTPRequestHandler):
 def start_server(port: int | None = None, host: str = "127.0.0.1") -> tuple[ThreadingHTTPServer, int]:
     db.init_db()
     auth.ensure_builtin_admin()      # 首次启动创建内置管理员（见 auth.BUILTIN_ADMIN_*）
+    backup.start_scheduler()         # 定期备份调度线程（到期才真正干活）
     # 注意：镜像不再内置任何项目库数据，新实例项目库为空，由管理员自行导入。
     port = port or find_free_port()
     httpd = ThreadingHTTPServer((host, port), Handler)

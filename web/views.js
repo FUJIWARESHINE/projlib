@@ -2162,9 +2162,106 @@ function resetPwdDialog(u) {
 }
 
 /* ==================================================================== 设置 */
+const BK_INTERVALS = [
+  [1, "每 1 小时"], [3, "每 3 小时"], [6, "每 6 小时"], [12, "每 12 小时"],
+  [24, "每天"], [48, "每 2 天"], [72, "每 3 天"], [168, "每周"],
+];
+
+/* 路径展示统一正斜杠：Windows 反斜杠写法和容器的 /data/x 要一个画风 */
+function px(s) { return String(s == null ? "" : s).replace(/\\/g, "/"); }
+
+function fmtSize(n) {
+  const b = Number(n || 0);
+  if (b < 1024) return b + " B";
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+  return (b / 1024 / 1024).toFixed(2) + " MB";
+}
+
+function bkKindClass(tag) {
+  return tag === "auto" ? "auto" : tag === "before-restore" ? "safe" : "manual";
+}
+
+/* 服务端目录浏览器：容器部署时没法弹系统「选择文件夹」，只能在服务端的
+   目录树里点。只列目录、不列文件，避免顺手把别的东西暴露出去。 */
+function pickBackupDir(start) {
+  return new Promise((resolve) => {
+    let picked = "";
+    openModal({
+      title: "选择备份文件夹",
+      wide: true,
+      body: `
+        <div class="dp-wrap">
+          <div class="dp-bar">
+            <button class="btn btn-sm btn-ghost" id="dpUp">↑ 上级</button>
+            <input class="input" id="dpPath" spellcheck="false" autocomplete="off">
+            <button class="btn btn-sm btn-ghost" id="dpGo">前往</button>
+            <button class="btn btn-sm btn-ghost" id="dpWin" hidden>系统选择框</button>
+          </div>
+          <div class="dp-chips" id="dpChips"></div>
+          <div class="dp-list" id="dpList"><div class="loading">加载中…</div></div>
+          <div class="hint" id="dpTip"></div>
+        </div>`,
+      footer: `<button class="btn btn-ghost" data-close>取消</button>
+               <button class="btn btn-primary" id="dpOk">选择此文件夹</button>`,
+      onMount(root) {
+        const listEl = $("#dpList", root);
+        let parentPath = "";
+        const load = async (p) => {
+          listEl.innerHTML = '<div class="loading">加载中…</div>';
+          try {
+            const r = await api("/api/backup/browse?path=" + encodeURIComponent(p || ""));
+            const d = r.data;
+            parentPath = d.parent || "";
+            $("#dpPath", root).value = px(d.path);
+            $("#dpUp", root).disabled = !parentPath;
+            $("#dpChips", root).innerHTML = (d.shortcuts || []).map((s) =>
+              `<button class="dp-chip" data-p="${esc(s.path)}">${esc(s.name)}</button>`).join("");
+            // 只有跑在 Windows 桌面（exe）上才给「系统选择框」，容器里没意义
+            $("#dpWin", root).hidden = !d.native;
+            $$(".dp-chip", $("#dpChips", root)).forEach((b) =>
+              b.addEventListener("click", () => load(b.dataset.p)));
+            listEl.innerHTML = d.dirs.length
+              ? d.dirs.map((x) => `<button class="dp-item" data-p="${esc(x.path)}">
+                  <span class="dp-ico">📁</span><span class="dp-name">${esc(x.name)}</span></button>`).join("")
+              : '<div class="empty"><p>这个文件夹下没有子文件夹</p></div>';
+            $$(".dp-item", listEl).forEach((b) =>
+              b.addEventListener("click", () => load(b.dataset.p)));
+            $("#dpTip", root).textContent = d.writable
+              ? "当前目录可写，点右下角「选择此文件夹」即可。"
+              : "⚠️ 当前目录不可写，换个有权限的位置。";
+          } catch (e) {
+            listEl.innerHTML = `<div class="empty"><p>${esc(e.message)}</p></div>`;
+            $("#dpTip", root).textContent = "";
+          }
+        };
+        $("#dpUp", root).addEventListener("click", () => { if (parentPath) load(parentPath); });
+        $("#dpGo", root).addEventListener("click", () => load($("#dpPath", root).value.trim()));
+        // 桌面模式走系统「选择文件夹」对话框；容器里这个按钮是隐藏的
+        $("#dpWin", root).addEventListener("click", async () => {
+          try {
+            const r = await api("/api/backup/pick-dir", { method: "POST", body: {} });
+            const p = (r.data && r.data.path) || "";
+            if (p) load(p);
+          } catch (e) { toast(e.message, "error"); }
+        });
+        $("#dpPath", root).addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); load($("#dpPath", root).value.trim()); }
+        });
+        $("#dpOk", root).addEventListener("click", () => {
+          picked = px($("#dpPath", root).value.trim());
+          closeModal();
+        });
+        load(start || "");
+      },
+      onClose() { resolve(picked); },
+    });
+  });
+}
+
 VIEWS.settings = async (root) => {
-  const r = await api("/api/settings");
+  const [r, b] = await Promise.all([api("/api/settings"), api("/api/backup")]);
   const s = r.data;
+  const cfg = b.data.config;
   root.innerHTML = `
     <div class="settings-grid">
       <div class="card" style="margin:0">
@@ -2190,8 +2287,173 @@ VIEWS.settings = async (root) => {
           <div class="hint" style="margin-top:6px">「清空项目库」会删除当前全部项目（<b>不影响</b>用户账号、系统设置与月末统计填报）；程序不内置任何项目数据，请用「导入项目库」自己导入。</div>
         </div>
       </div>
+
+      <div class="card bk-card">
+        <div class="card-head">
+          <h3>数据库备份</h3>
+          <span class="badge off" id="bkBadge">—</span>
+        </div>
+        <div class="card-body">
+          <div class="bk-top">
+            <div class="field bk-dirfield">
+              <label>备份目录</label>
+              <div class="bk-dirrow">
+                <input class="input" id="bkDir" spellcheck="false" autocomplete="off"
+                  value="${esc(px(cfg.dir))}" placeholder="${esc(px(cfg.dir_default))}">
+                <button class="btn btn-ghost" id="bkBrowse">浏览…</button>
+              </div>
+              <div class="hint">留空＝数据目录下的 <code>backups</code> 文件夹（<span class="mono">${esc(px(cfg.dir_default))}</span>）。容器部署请填<b>挂载出来的卷路径</b>，比如 <code>/data/backups</code>、<code>/backup</code>。</div>
+            </div>
+            <div class="bk-opts">
+              <label class="switch"><input type="checkbox" id="bkAuto">
+                <span class="switch-track"></span><span class="switch-text">定期自动备份</span></label>
+              <div class="field"><label>备份间隔</label>
+                <select class="select" id="bkInterval">
+                  ${BK_INTERVALS.map(([v, t]) => `<option value="${v}">${t}</option>`).join("")}
+                </select></div>
+              <div class="field"><label>保留份数</label>
+                <input class="input" type="number" id="bkKeep" min="1" max="200" step="1">
+                <div class="hint">超出后自动删除<b>最早</b>的备份，避免占满磁盘。</div></div>
+            </div>
+          </div>
+          <div class="bk-actions">
+            <button class="btn btn-primary" id="bkSave">保存备份设置</button>
+            <button class="btn btn-ghost" id="bkRun">立即备份</button>
+            <span class="bk-stat" id="bkStat"></span>
+          </div>
+          <div class="divider"></div>
+          <div class="bk-listhead">
+            <b>备份文件</b>
+            <span class="hint" id="bkListHint"></span>
+          </div>
+          <div class="table-wrap bk-table">
+            <table class="tbl">
+              <thead><tr>
+                <th style="width:150px">备份时间</th>
+                <th style="width:100px">类型</th>
+                <th class="num" style="width:90px">大小</th>
+                <th>文件名</th>
+                <th style="width:170px">操作</th>
+              </tr></thead>
+              <tbody id="bkList"><tr><td colspan="5"><div class="loading">加载中…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>`;
 
+  /* ---- 备份卡片渲染 ---- */
+  let bkState = b.data;
+  const applyBk = (d) => {
+    if (d) bkState = { config: d.config || bkState.config, status: d.status || bkState.status, items: d.items || [] };
+    const st = bkState.status;
+    const c = bkState.config;
+    $("#bkBadge").textContent = c.auto ? "自动备份已开启" : "自动备份已关闭";
+    $("#bkBadge").className = "badge " + (c.auto ? "on" : "off");
+    const parts = [];
+    parts.push(st.last_at
+      ? `上次备份 ${esc(st.last_at)}${st.last_kind === "auto" ? "（自动）" : ""}`
+      : "还没有备份过");
+    if (c.auto && st.next_at) parts.push(`下次约 ${esc(st.next_at)}`);
+    parts.push(`现有 ${st.count} 份 / ${fmtSize(st.total_size)}`);
+    $("#bkStat").innerHTML = parts.join("　·　");
+    if (st.last_error) {
+      $("#bkStat").innerHTML += `<span class="bk-err">⚠️ ${esc(st.last_error)}</span>`;
+    }
+    $("#bkListHint").textContent = c.auto
+      ? `保留最近 ${c.keep} 份，超出自动清理最早的`
+      : `自动备份已关闭，仅保留手动备份`;
+    const rows = bkState.items;
+    $("#bkList").innerHTML = rows.length ? rows.map((it) => `
+      <tr data-name="${esc(it.name)}">
+        <td>${esc(it.time)}</td>
+        <td><span class="bk-tag ${bkKindClass(it.tag)}">${esc(it.kind)}</span></td>
+        <td class="num">${fmtSize(it.size)}</td>
+        <td><span class="bk-file" title="${esc(it.name)}">${esc(it.name)}</span></td>
+        <td class="bk-ops">
+          <a class="btn btn-sm btn-ghost" href="/api/backup/download?name=${encodeURIComponent(it.name)}">下载</a>
+          <button class="btn btn-sm btn-ghost" data-act="restore">恢复</button>
+          <button class="btn btn-sm btn-ghost danger" data-act="del">删除</button>
+        </td>
+      </tr>`).join("")
+      : `<tr><td colspan="5"><div class="empty"><p>还没有备份文件，点「立即备份」生成第一份</p></div></td></tr>`;
+
+    $$("#bkList [data-act]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const name = btn.closest("tr").dataset.name;
+        if (btn.dataset.act === "del") {
+          if (!confirm(`确定删除这份备份？\n\n${name}\n\n删除后不可恢复。`)) return;
+          try {
+            const res = await api("/api/backup/file?name=" + encodeURIComponent(name), { method: "DELETE" });
+            applyBk(res.data); toast("已删除");
+          } catch (e) { toast(e.message, "error"); }
+          return;
+        }
+        if (!confirm(`用这份备份覆盖当前数据库？\n\n${name}\n\n· 覆盖前会自动把当前数据库另存一份（before-restore）\n· 恢复后所有人可能需要重新登录\n· 建议恢复完刷新页面`)) return;
+        try {
+          const res = await api("/api/backup/restore", { method: "POST", body: { name } });
+          const d = res.data;
+          applyBk(d);
+          await alertDialog("已恢复到备份", `
+            <p>已用 <b>${esc(name)}</b> 覆盖当前数据库。</p>
+            <p class="hint" style="margin-top:8px">覆盖前的数据库已另存为 <code>${esc(d.safety_copy)}</code>，不满意可以再恢复回来。</p>
+            <p class="hint" style="margin-top:8px">如果页面数据看着不对，刷新一下（Ctrl+F5）即可。</p>`);
+          go("settings");
+        } catch (e) { toast(e.message, "error"); }
+      });
+    });
+  };
+
+  /* 初值 */
+  $("#bkAuto").checked = !!cfg.auto;
+  $("#bkInterval").value = String(cfg.interval_hours);
+  if (!$("#bkInterval").value) {
+    // 自定义小时数不在预设里时补一个选项，别把用户设置吃掉
+    const op = document.createElement("option");
+    op.value = String(cfg.interval_hours);
+    op.textContent = `每 ${cfg.interval_hours} 小时`;
+    $("#bkInterval").appendChild(op);
+    $("#bkInterval").value = String(cfg.interval_hours);
+  }
+  $("#bkKeep").value = cfg.keep;
+  applyBk(b.data);
+
+  /* ---- 备份操作 ---- */
+  $("#bkBrowse").addEventListener("click", async () => {
+    const dir = await pickBackupDir($("#bkDir").value.trim() || cfg.dir_effective);
+    if (dir) $("#bkDir").value = dir;
+  });
+  $("#bkSave").addEventListener("click", async () => {
+    const keep = parseInt($("#bkKeep").value, 10);
+    if (!keep || keep < 1 || keep > 200) return toast("保留份数请填 1~200", "error");
+    try {
+      const res = await api("/api/backup", {
+        method: "PUT",
+        body: {
+          dir: $("#bkDir").value.trim(),
+          auto: $("#bkAuto").checked,
+          interval_hours: parseInt($("#bkInterval").value, 10) || 24,
+          keep,
+        },
+      });
+      applyBk(res.data);
+      toast("备份设置已保存");
+    } catch (e) { toast(e.message, "error"); }
+  });
+  $("#bkRun").addEventListener("click", async () => {
+    const btn = $("#bkRun");
+    btn.disabled = true; btn.textContent = "备份中…";
+    try {
+      const res = await api("/api/backup/run", { method: "POST", body: {} });
+      const d = res.data;
+      applyBk(d);
+      toast(`已备份：${d.name}（${fmtSize(d.size)}）` +
+        (d.removed && d.removed.length ? `，清理 ${d.removed.length} 份旧备份` : ""), "success", 4200);
+    } catch (e) { toast(e.message, "error"); }
+    btn.disabled = false; btn.textContent = "立即备份";
+  });
+
+  /* ---- 其它卡片 ---- */
   $("#btnSave").addEventListener("click", async () => {
     try {
       await api("/api/settings", { method: "PUT", body: { export_dir: $("#s_dir").value.trim() } });
@@ -2206,9 +2468,15 @@ VIEWS.settings = async (root) => {
     } catch (e) { toast(e.message, "error"); }
   });
   $("#btnBackup").addEventListener("click", async () => {
-    try { await api("/api/system/backup", { method: "POST", body: {} });
-      toast("数据库已备份到服务器数据目录", "info", 4000); }
-    catch (e) { toast(e.message, "error"); }
+    try {
+      const r = await api("/api/system/backup", { method: "POST", body: {} });
+      const d = r.data || {};
+      toast(`已备份：${d.name || "完成"}`, "success", 4200);
+      if ($("#bkList")) {
+        const nb = await api("/api/backup");
+        applyBk(nb.data);
+      }
+    } catch (e) { toast(e.message, "error"); }
   });
   $("#btnClearLib").addEventListener("click", async () => {
     if (!confirm("「清空项目库」会删除当前项目库里的全部项目，且不可恢复。\n\n用户账号、系统设置、月末项目统计填报不受影响。\n建议先「备份数据库」。确定继续？")) return;
@@ -2224,12 +2492,16 @@ VIEWS.settings = async (root) => {
   try {
     const info = await api("/api/system/info");
     const d = info.data;
+    // ⚠️ 必须把 loading 类摘掉：.loading::after 是转圈伪元素，
+    // 只改 innerHTML 的话类名还在，转圈会一直挂在数据下面（还带 40px padding）
+    $("#sysInfo").classList.remove("loading");
     $("#sysInfo").innerHTML = `
       <div class="kv"><span class="k">数据目录</span><span style="font-size:12px;font-family:Consolas,monospace">${esc(d.data_dir)}</span></div>
       <div class="kv"><span class="k">数据库大小</span><b>${(d.db_size / 1024).toFixed(1)} KB</b></div>
       <div class="kv"><span class="k">项目记录数</span><b>${d.total}</b></div>
       <div class="kv"><span class="k">上次导入</span><span>${esc(d.last_import || "—")}</span></div>`;
   } catch (e) {
+    $("#sysInfo").classList.remove("loading");
     $("#sysInfo").innerHTML = `<div class="empty"><p>${esc(e.message)}</p></div>`;
   }
 };
