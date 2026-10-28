@@ -279,8 +279,10 @@ async function loadNotifications({ popup = true, silent = true } = {}) {
   state.notif.items = d.items || [];
   state.notif.unread = d.unread || 0;
   state.notif.popups = d.popups || [];
-  state.notif.canAudit = !!d.can_audit;
+  // 管理员的后端 can_audit 恒为 0（他不需要「审核员」身份），但复审是他的活：
+  // 只要后端给了待办清单，或本身是管理员，这个工作台就要显示出来。
   state.notif.audits = d.audits || [];
+  state.notif.canAudit = !!(d.can_audit || isAdmin() || state.notif.audits.length);
   renderNotifBadge();
   if (state.notif.open) renderNotifPanel();
   if (popup && state.notif.popups.length) showNotifBanner(state.notif.popups);
@@ -295,7 +297,9 @@ function renderNotifBadge() {
   else { b.hidden = true; b.textContent = "0"; }
   b.title = n > 0
     ? (state.notif.canAudit && n > 0
-        ? `${n} 条未读（含待审核，点「审核完成」后红点才消）`
+        ? (isAdmin()
+            ? `${n} 条未读（含待审核 / 待复审，项目走完「复审通过」前红点不会消）`
+            : `${n} 条未读（含待审核，点「审核完成」后红点才消）`)
         : `${n} 条未读`)
     : "";
   if (bell) bell.classList.toggle("has-unread", n > 0);
@@ -304,20 +308,41 @@ function renderNotifBadge() {
 function notifItemHtml(n) {
   const tag = NOTIF_TAG[n.category] || "";
   const icon = NOTIF_ICON[n.category] || "🔔";
-  const isAudit = n.category === "audit_request";
+  const isAudit = n.category === "audit_request";   // 发给审核员：请审核
+  const isReview = n.category === "audit_done";     // 发给管理员：请复审
   // sticky = 待审核项目的「请审核」提醒：点过、点过「全部已读」、清空过都不算数，
   //   这条永远按未读渲染（右侧红点不灭）、右上角角标也一直计数，
   //   只有点了「审核完成」才取消 —— 消息多的时候不至于漏掉待审核项目。
   const unread = !n.read || !!n.sticky;
-  // 同一项目可能有多轮「请审核」提醒：旧的那轮已被新一轮替代，别再给按钮
-  const act = isAudit
-    ? (n.superseded
-        ? `<div class="ni-act"><span class="ni-done">↩︎ 已被新一轮提醒替代</span></div>`
-        : n.audit_pending
+  // 同一项目可能有多轮提醒：旧的那轮已被新一轮替代，别再给按钮
+  let act = "";
+  if (isAudit) {
+    act = n.superseded
+      ? `<div class="ni-act"><span class="ni-done">↩︎ 已被新一轮提醒替代</span></div>`
+      : n.audit_pending
         ? `<div class="ni-act"><button class="btn btn-green btn-sm" data-audit="${n.audit_id}">审核完成</button>
              <span class="ni-hint">复核无误后点这里；<b>没点之前红点不会消</b>，以免漏审</span></div>`
-        : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`)
-    : "";
+        : n.audit_need_confirm
+          ? `<div class="ni-act"><span class="ni-done">✅ 已复核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}，等管理员复审</span></div>`
+          : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`;
+  } else if (isReview) {
+    // 「某某某已审核完成，请复审」：以前这句话没有任何落点，现在挂在审核单的
+    // audited 状态上 —— 管理员在这儿就能点「复审通过」，单子才算走完。
+    act = n.superseded
+      ? `<div class="ni-act"><span class="ni-done">↩︎ 已被新一轮提醒替代</span></div>`
+      : n.audit_need_confirm
+        ? (isAdmin()
+            ? `<div class="ni-act"><button class="btn btn-primary btn-sm" data-review="${n.audit_id}">复审通过</button>
+                 <span class="ni-hint">确认无误后点这里；<b>没点之前这个项目一直算「待复审」</b></span></div>`
+            : `<div class="ni-act"><span class="ni-done">⏳ 已复核，等管理员复审</span></div>`)
+        : n.audit_pending
+          ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，需重新审核</span></div>`
+          : n.audit_status === "void"
+            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目已退回未完成，审核单已撤</span></div>`
+            : n.audit_status === "done"
+              ? `<div class="ni-act"><span class="ni-done">✅ 已复审${n.audit_confirmer ? "（" + esc(n.audit_confirmer) + "）" : ""}</span></div>`
+              : "";
+  }
   // 全服通告：标出这条是发给哪些平台的（全体成员 / 细胞、分子）
   const aud = n.category === "broadcast"
     ? `<span class="ni-plat">接收：${esc(n.target_platform_label || "全体成员")}</span>` : "";
@@ -335,22 +360,29 @@ function notifItemHtml(n) {
   </div>`;
 }
 
-/* 「待我审核」区块：审核员的工作台。比通知更可靠 —— 只要项目还是 pending 就在这儿。 */
+/* 「待我处理」区块：审核 / 复审的工作台。比通知更可靠 —— 只要审核单还没走完就在这儿。
+   审核员看到的是待他复核（pending）；管理员还能看到已复核待复审（audited）的那些。 */
 function notifAuditHtml() {
   const list = state.notif.audits || [];
   if (!state.notif.canAudit || !list.length) return "";
   const shown = list.slice(0, 8);
+  const admin = isAdmin();
   return `
     <div class="notif-audit">
-      <div class="na-head">待我审核 <span class="np-pill">${list.length} 个</span></div>
-      ${shown.map((a) => `
+      <div class="na-head">${admin ? "待我处理（待审核 / 待复审）" : "待我审核"} <span class="np-pill">${list.length} 个</span></div>
+      ${shown.map((a) => {
+        const need = a.status === "audited";
+        return `
         <div class="na-item">
           <div class="na-main">
-            <div class="na-title">${notifTypePill(a.ptype)}${esc(a.code)} 项目已结项</div>
-            <div class="na-sub">${esc(a.name) || "—"}</div>
+            <div class="na-title">${notifTypePill(a.ptype)}${esc(a.code)} 项目${need ? "已复核，待复审" : "已结项，待审核"}</div>
+            <div class="na-sub">${esc(a.name) || "—"}${need ? ` · 复核人 ${esc(a.auditor_name) || "—"}` : ""}</div>
           </div>
-          <button class="btn btn-green btn-sm" data-audit="${a.id}">审核完成</button>
-        </div>`).join("")}
+          ${need
+            ? `<button class="btn btn-primary btn-sm" data-review="${a.id}">复审通过</button>`
+            : `<button class="btn btn-green btn-sm" data-audit="${a.id}">审核完成</button>`}
+        </div>`;
+      }).join("")}
       ${list.length > shown.length ? `<div class="na-more">还有 ${list.length - shown.length} 个…</div>` : ""}
     </div>`;
 }
@@ -386,7 +418,7 @@ function renderNotifPanel() {
           : '<div class="notif-empty">暂时没有消息</div>'}
       </div>
       <div class="notif-foot">${isAdmin()
-        ? "实验员把平台勾成 ✅、审核员复核完成后，这里会收到「平台完成 / 项目结项 / 审核完成」提醒。要发全服提醒，去左侧「全服通告」。"
+        ? "实验员把平台勾成 ✅、审核员复核完成后，这里会收到「平台完成 / 项目结项 / 审核完成」提醒；点「复审通过」才算把这轮审核走完（没点之前项目一直挂在「待审核」统计里）。要发全服提醒，去左侧「全服通告」。"
         : state.notif.canAudit
           ? "管理员新增项目后这里会收到「项目已入库」；项目结项后这里会出现「待审核」，复核完点「审核完成」；📢全服通告也会送到这里。待审核项目在点「审核完成」之前，这条消息和右上角红点会一直保留（点过、全部已读、清空都消不掉）。"
           : "管理员新增项目后，这里会收到「项目已入库」提醒；管理员发布的📢全服通告（发给你所在平台的）也会送到这里。"}</div>
@@ -394,18 +426,38 @@ function renderNotifPanel() {
   bindNotifPanel();
 }
 
-/* 审核完成：复核无误 → 后端标记 done 并通知全体管理员「某某某已审核完成，请复审」。 */
+/* 审核完成：复核无误 → 后端置 audited 并通知全体管理员「某某某已审核完成，请复审」。
+   管理员自己点的话一步到位（后端 final=true），不用再自己复审一遍。 */
 async function finishAudit(aid, btn) {
   if (!aid) return;
   const el = btn || null;
   if (el) el.disabled = true;
+  let res;
   try {
-    await api(`/api/audits/${aid}/done`, { method: "POST", body: {} });
+    res = await api(`/api/audits/${aid}/done`, { method: "POST", body: {} });
   } catch (e) {
     if (el) el.disabled = false;
     return toast(e.message, "error");
   }
-  toast("已审核完成，已通知管理员复审");
+  toast((res.data && res.data.final)
+    ? "已审核完成（管理员复审同步完成）"
+    : "已审核完成，已通知管理员复审");
+  await loadNotifications({ popup: false });
+  if (state.notif.open) renderNotifPanel();
+}
+
+/* 复审通过（仅管理员）：audited → done，这才是「请复审」的落点。 */
+async function confirmAudit(aid, btn) {
+  if (!aid) return;
+  const el = btn || null;
+  if (el) el.disabled = true;
+  try {
+    await api(`/api/audits/${aid}/confirm`, { method: "POST", body: {} });
+  } catch (e) {
+    if (el) el.disabled = false;
+    return toast(e.message, "error");
+  }
+  toast("已复审通过，该项目已完成审核");
   await loadNotifications({ popup: false });
   if (state.notif.open) renderNotifPanel();
 }
@@ -424,6 +476,12 @@ function bindNotifPanel() {
     ev.stopPropagation();
     ev.preventDefault();
     finishAudit(Number(el.dataset.audit), el);
+  }));
+  // 「复审通过」（管理员）：同上，别冒泡
+  root.querySelectorAll("[data-review]").forEach((el) => el.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    confirmAudit(Number(el.dataset.review), el);
   }));
 
   const all = panel.querySelector("[data-notif-allread]");

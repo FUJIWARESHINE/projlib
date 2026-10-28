@@ -319,7 +319,8 @@ VIEWS.browse = async (root) => {
   const types = await loadTypes();
   const C = loadColW();
   const cols = browseCols();
-  // 待审核统计：管理员与开了审核权限的账号才拉（没权限会 403，静默忽略）
+  // 待审核统计：管理员与开了审核权限的账号才拉（没权限会 403，静默忽略）。
+  // 口径由后端按角色给：审核员 = 等他复核的；管理员 = 待审核 + 已复核待复审。
   let auditItems = [];
   if (canAudit) {
     try { auditItems = (await api("/api/audits?status=pending")).data.items || []; }
@@ -362,7 +363,7 @@ VIEWS.browse = async (root) => {
         </select>
         <span class="spacer"></span>
         ${canAudit ? `<button class="btn btn-sm audit-entry${auditItems.length ? "" : " zero"}" id="btnAudits"
-          title="项目所有被设计平台都完成后产生审核单；点开查看全部待审核项目">
+          title="项目所有被设计平台都完成后产生审核单；审核员复核完还要管理员「复审通过」才算走完流程，没走完的项目都算在这里">
           <span class="aud-dot"></span>待审核<b id="auditCnt">${auditItems.length}</b></button>` : ""}
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
         ${admin ? `
@@ -529,16 +530,24 @@ VIEWS.browse = async (root) => {
 /* ------------------------------------------------ 待审核项目（项目库模块入口） */
 /* 项目所有被设计平台都勾成 ✅ 时，后端会自动落一条 project_audits(pending)。
    入口只给「管理员」和「开了审核权限的账号」显示（GET /api/audits 同口径，403 就藏起来）。
-   审核完成复用 POST /api/audits/<id>/done，与消息中心里的按钮是同一套逻辑。 */
+   两段式：pending 点「审核完成」→ audited，再由管理员点「复审通过」→ done。
+   ★ 这个数字必须把 audited 也算进来，否则审核员一点「审核完成」就变 0，
+     而管理员那条「请复审」的提醒还挂在消息中心，看起来就像「没进统计」。 */
 function auditRowHtml(a) {
+  const need = a.status === "audited";
   return `<div class="aud-row" data-aid="${a.id}">
     <div class="aud-main">
       <div class="aud-title">${typePill(a.ptype)}<b class="aud-code aud-jump" data-aud-jump="${esc(a.code)}"
         title="在项目库里查看这个项目">${esc(a.code)}</b>
-        <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span></div>
-      <div class="aud-sub">结项时间 ${esc(notifTime(a.created_at)) || "—"} · 已全部平台完成，待复核</div>
+        <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span>
+        ${need ? '<span class="ni-tag ni-lock">待复审</span>' : ""}</div>
+      <div class="aud-sub">${need
+        ? `复核人 ${esc(a.auditor_name) || "—"} · 复核时间 ${esc(notifTime(a.reviewed_at)) || "—"} · 等管理员复审`
+        : `结项时间 ${esc(notifTime(a.created_at)) || "—"} · 已全部平台完成，待复核`}</div>
     </div>
-    <button class="btn btn-green btn-sm" data-aud="${a.id}">审核完成</button>
+    ${need
+      ? `<button class="btn btn-primary btn-sm" data-rev="${a.id}">复审通过</button>`
+      : `<button class="btn btn-green btn-sm" data-aud="${a.id}">审核完成</button>`}
   </div>`;
 }
 
@@ -563,9 +572,11 @@ async function pendingAuditsDialog() {
         if (btn) btn.classList.toggle("zero", !items.length);
       };
       const paint = () => {
+        const needCnt = items.filter((x) => x.status === "audited").length;
         wrap.innerHTML = `
-          <div class="aud-head">当前共 <b>${items.length}</b> 个待审核项目${items.length
-            ? "，复核无误后点「审核完成」，管理员会收到复审提醒。" : "。"}</div>
+          <div class="aud-head">当前共 <b>${items.length}</b> 个待处理项目${needCnt
+            ? `（其中 <b>${needCnt}</b> 个已复核、等你复审）` : ""}${items.length
+            ? "。审核员复核无误后点「审核完成」，管理员收到复审提醒；管理员复核无误后点「复审通过」，这一轮才算走完。" : "。"}</div>
           <div class="aud-list">${items.length ? items.map(auditRowHtml).join("")
             : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>`;
         syncEntry();
@@ -581,9 +592,23 @@ async function pendingAuditsDialog() {
           ev.stopPropagation();
           const btn = ev.currentTarget;
           btn.disabled = true;
-          try { await api("/api/audits/" + btn.dataset.aud + "/done", { method: "POST", body: {} }); }
+          let res;
+          try { res = await api("/api/audits/" + btn.dataset.aud + "/done", { method: "POST", body: {} }); }
           catch (e) { btn.disabled = false; return toast(e.message, "error"); }
-          toast("已审核完成，已通知管理员复审");
+          toast((res.data && res.data.final)
+            ? "已审核完成（管理员复审同步完成）"
+            : "已审核完成，已通知管理员复审");
+          try { await fetchAudits(); } catch (e) { /* 拉不到就保留旧列表 */ }
+          paint();
+          loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标
+        }));
+        $$("[data-rev]", wrap).forEach((b) => b.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          try { await api("/api/audits/" + btn.dataset.rev + "/confirm", { method: "POST", body: {} }); }
+          catch (e) { btn.disabled = false; return toast(e.message, "error"); }
+          toast("已复审通过，该项目已完成审核");
           try { await fetchAudits(); } catch (e) { /* 拉不到就保留旧列表 */ }
           paint();
           loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标

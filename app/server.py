@@ -242,8 +242,9 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
        **仅普通账户操作时播报** —— 管理员在项目库里替人勾选时不给自己刷屏。
     ② 结项 / 复核：写入后项目处于「已完成」状态，且**平台完成情况确实变了**，才建单。
        · 首次结项（未完成 → 完成）→ 建单 + 通知；
-       · 已审核过（单子 done）之后又改了平台完成情况（cell/mol/path/animal 任一列）
-         → **重新开单**，通知文案写「请重新审核」；
+       · 已复核（audited，等管理员复审）/ 已复审（done）之后又改了平台完成情况
+         （cell/mol/path/animal 任一列）→ **重新开单**，状态重置回 pending，
+         通知文案写「请重新审核」；
          这是「复核」的正路 —— 早期只认「未完成 → 完成」这一次状态迁移，
          于是复核阶段在编辑弹窗里改平台（完成状态没翻转）就静默丢掉，
          待审核统计里始终没有这个项目，只有最早那条通知。
@@ -309,26 +310,52 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
 
 
 def api_audits(query, _b, ctx=None):
-    """结项待审核清单。仅「有审核权限的普通账户」与管理员可看。"""
+    """结项审核清单。仅「有审核权限的普通账户」与管理员可看。
+
+    ?status=pending（默认）= **待我处理**，按角色分开算：
+      · 审核员 → pending（等他复核）；
+      · 管理员 → pending + audited（等他复审）。
+      这是「待审核」统计的唯一口径 —— 以前不分角色只数 pending，
+      审核员一点「审核完成」，管理员那边就定格在 0，可「请复审」的提醒还挂着。
+    ?status=done / void / audited / all 查历史（只读展示用）。
+    """
     user = (ctx or {}).get("user") or {}
-    if not (user.get("can_audit") or auth.is_admin(user)):
+    is_admin = auth.is_admin(user)
+    if not (user.get("can_audit") or is_admin):
         return fail("没有审核权限", 403)
     status = (query.get("status", ["pending"])[0] or "pending").strip()
-    if status not in ("pending", "done", "all"):
+    if status not in ("pending", "open", "audited", "done", "void", "all"):
         return fail("status 不合法", 400)
-    items = db.list_audits("" if status == "all" else status)
-    return ok({"items": items, "pending": db.count_audits("pending"),
-               "can_audit": bool(user.get("can_audit"))})
+    if status in ("pending", "open"):
+        items = db.list_open_audits(is_admin)
+    elif status == "all":
+        items = db.list_audits("")
+    else:
+        items = db.list_audits(status)
+    return ok({"items": items,
+               "pending": db.count_audits("pending"),
+               "audited": db.count_audits("audited"),
+               "open": db.count_audits("open"),
+               "can_audit": bool(user.get("can_audit")),
+               "is_admin": is_admin})
 
 
 def api_audit_done(_q, _b, aid, ctx=None):
-    """审核员复核完成 → 通知全体管理员「某某某已审核完成，请复审」。"""
+    """复核完成。审核员 → 置 audited 并通知管理员「请复审」；管理员自己看 → 直接 done。
+
+    ★ 只有 pending 能点。audited 说明已经复核过了，等的是管理员复审，
+      再点「审核完成」没有任何意义（也免得同一个人既审核又复审、把单子刷成 done）。
+    """
     user = (ctx or {}).get("user") or {}
-    if not (user.get("can_audit") or auth.is_admin(user)):
+    is_admin = auth.is_admin(user)
+    if not (user.get("can_audit") or is_admin):
         return fail("没有审核权限", 403)
-    if not db.get_audit(aid):
+    cur = db.get_audit(aid)
+    if not cur:
         return fail("该审核记录不存在", 404)
-    done = db.complete_audit(aid, user)
+    if cur.get("status") != db.AUDIT_PENDING:
+        return fail(f"该项目{cur.get('status_name') or '已处理'}，无需再复核", 409, audit=cur)
+    done = db.complete_audit(aid, user, final=is_admin)
     if not done:
         return fail("该项目已经审核过了", 409, audit=db.get_audit(aid))
     # 通知文案里的人名一律取账号**姓名**（db.person_label；账号没填姓名则写成「账号 xxx」）
@@ -337,13 +364,41 @@ def api_audit_done(_q, _b, aid, ctx=None):
     _safe_notify(db.mark_notif_read_for_project,
                  int(user.get("id") or 0), db.NOTIF_AUDIT_REQUEST,
                  done["ptype"], done["code"])
+    if is_admin:
+        # 管理员本来就有复审权，一步到位，不给自己再发一条「请复审」
+        return ok({"audit": done, "auditor": who, "final": True})
     _safe_notify(db.add_notification,
                  db.NOTIF_AUDIT_DONE, db.ROLE_ADMIN,
                  f"{done['code']}项目 {who}已审核完成，请复审",
                  f"{done['type_label']}｜{done['name']}",
                  ptype=done["ptype"], code=done["code"],
                  project_id=done["project_id"], created_by=int(user.get("id") or 0))
-    return ok({"audit": done, "auditor": who})
+    return ok({"audit": done, "auditor": who, "final": False})
+
+
+def api_audit_confirm(_q, _b, aid, ctx=None):
+    """管理员复审通过：audited → done，并把「我」那条「请复审」提醒收掉。
+
+    复审是两段式的第二段 —— 以前缺这一段，所以「请复审」只是句空话：
+    审核员点完「审核完成」，待审核统计立刻归 0，项目也再没出现在任何待办里。
+    """
+    user = (ctx or {}).get("user") or {}
+    if not auth.is_admin(user):
+        return fail("只有管理员可以复审", 403)
+    cur = db.get_audit(aid)
+    if not cur:
+        return fail("该审核记录不存在", 404)
+    if cur.get("status") != db.AUDIT_AUDITED:
+        return fail(f"该项目{cur.get('status_name') or '不在待复审状态'}，无需再复审",
+                    409, audit=cur)
+    done = db.confirm_audit(aid, user)
+    if not done:
+        return fail("该项目已经复审过了", 409, audit=db.get_audit(aid))
+    who = db.person_label(user)
+    _safe_notify(db.mark_notif_read_for_project,
+                 int(user.get("id") or 0), db.NOTIF_AUDIT_DONE,
+                 done["ptype"], done["code"])
+    return ok({"audit": done, "confirmer": who})
 
 
 def api_notifications(query, _b, ctx=None):
@@ -374,8 +429,10 @@ def api_notifications(query, _b, ctx=None):
         "popups": db.notif_pending_popups(uid, roles, platform=plat),
         "roles": roles,
         "can_audit": bool(user.get("can_audit")),
-        # 有审核权限时带上「待我审核」清单，消息中心直接列出来
-        "audits": db.list_audits("pending", limit=50) if user.get("can_audit") else [],
+        # 有审核权限 / 管理员时带上「待我处理」清单，消息中心直接列出来。
+        # 审核员只列待他复核的；管理员还要列「已复核待复审」的（那才是「请复审」的落点）。
+        "audits": db.list_open_audits(auth.is_admin(user), limit=50)
+                  if (user.get("can_audit") or auth.is_admin(user)) else [],
     })
 
 
@@ -1467,9 +1524,10 @@ ROUTES = [
     ("GET", re.compile(r"^/api/notifications$"), api_notifications),
     ("POST", re.compile(r"^/api/notifications/read$"), api_notifications_read),
     ("POST", re.compile(r"^/api/notifications/clear$"), api_notifications_clear),
-    # ---- 结项审核（有审核权限的普通账户；管理员也能看）
+    # ---- 结项审核（两段式：审核员复核 → 管理员复审）
     ("GET", re.compile(r"^/api/audits$"), api_audits),
     ("POST", re.compile(r"^/api/audits/(\d+)/done$"), api_audit_done),
+    ("POST", re.compile(r"^/api/audits/(\d+)/confirm$"), api_audit_confirm),
     # ---- 全服通告（仅管理员：发布 / 查看已发布 / 撤回）
     ("GET", re.compile(r"^/api/broadcasts$"), api_broadcasts),
     ("POST", re.compile(r"^/api/broadcasts$"), api_broadcast_create),
@@ -1503,7 +1561,7 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_set_platform_status,
              api_create_project, api_update_project, api_import_run, api_import_path,
              api_notifications, api_notifications_read, api_notifications_clear,
-             api_audits, api_audit_done,
+             api_audits, api_audit_done, api_audit_confirm,
              api_broadcasts, api_broadcast_create, api_broadcast_reads,
              api_broadcast_delete,
              api_worklogs_list, api_worklog_create, api_worklog_update,

@@ -234,20 +234,27 @@ CREATE TABLE IF NOT EXISTS notification_reads(
   PRIMARY KEY(notification_id, user_id)
 );
 
--- 结项待审核：项目所有被设计平台都完成后生成一条，由「有审核权限的普通账户」复核。
---   审核完成后 status='done'，并通知全体管理员「某某某已审核完成，请复审」。
---   同一项目再次结项（先取消再勾回来）会把这条重置成 pending。
+-- 结项审核：项目所有被设计平台都完成后生成一条，走**两段式**：
+--   pending  → 审核员复核（点「审核完成」）→ audited（已复核，等管理员复审）
+--   audited  → 管理员复审（点「复审通过」）→ done
+--   撤回（项目退出已完成 / 复核不通过退回返工）→ void
+--   ★ 2026-10-28：新增 audited。此前审核完直接 done，管理员那条「请复审」提醒
+--     没有任何落地状态 —— 待审核统计立刻归 0，复审这件事整个消失在系统里。
+--   ★ 同一项目再次结项（先取消再勾回来 / 内容变更）会把这条重置成 pending。
 CREATE TABLE IF NOT EXISTS project_audits(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ptype TEXT NOT NULL,
   code TEXT NOT NULL,
   project_id INTEGER DEFAULT 0,
   name TEXT DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending 待审核 / done 已审核
-  auditor_id INTEGER DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending 待审核 / audited 待复审 / done 已复审 / void 已撤回
+  auditor_id INTEGER DEFAULT 0,             -- 复核人（审核员）
   auditor_name TEXT DEFAULT '',
   created_at TEXT,
-  reviewed_at TEXT,
+  reviewed_at TEXT,                         -- 复核时间
+  confirmer_id INTEGER DEFAULT 0,           -- 复审人（管理员）
+  confirmer_name TEXT DEFAULT '',
+  confirmed_at TEXT,                        -- 复审时间；空 = 还没复审
   UNIQUE(ptype, code)
 );
 CREATE INDEX IF NOT EXISTS ix_audits_status ON project_audits(status, id);
@@ -312,6 +319,12 @@ def _migrate(conn) -> None:
     ② 补 users.can_audit 列（审核权限，2026-10-14 新增）。
     ③ 补 notification_reads.hidden 列（「清空消息中心」按人隐藏，2026-10-14 新增）。
     ④ 补 notifications.target_platform 列（全服通告按平台定向，2026-10-14 新增）。
+    ⑤ 补 project_audits 的复审字段（2026-10-28 新增）：
+       confirmer_id / confirmer_name / confirmed_at。
+       同时把**老库里所有 done** 改成 audited —— 旧版本审核员点「审核完成」就直接 done，
+       系统里从来没有「复审」这一步，所以这些单子实际上都还没被管理员复审过。
+       判断依据是 confirmed_at 为空：新版本复审/管理员直接审核都会写它，
+       因此这条 UPDATE 天然幂等，不会把新的 done 又翻回去。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     if "seq" not in cols:
@@ -331,6 +344,17 @@ def _migrate(conn) -> None:
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(notifications)")}
     if tcols and "target_platform" not in tcols:
         conn.execute("ALTER TABLE notifications ADD COLUMN target_platform TEXT DEFAULT ''")
+    # ⑤ 结项审核补「复审」三个字段 + 把老 done 补成待复审（见 docstring）
+    acols = {r["name"] for r in conn.execute("PRAGMA table_info(project_audits)")}
+    if acols:
+        if "confirmer_id" not in acols:
+            conn.execute("ALTER TABLE project_audits ADD COLUMN confirmer_id INTEGER DEFAULT 0")
+        if "confirmer_name" not in acols:
+            conn.execute("ALTER TABLE project_audits ADD COLUMN confirmer_name TEXT DEFAULT ''")
+        if "confirmed_at" not in acols:
+            conn.execute("ALTER TABLE project_audits ADD COLUMN confirmed_at TEXT")
+        conn.execute("UPDATE project_audits SET status='audited' "
+                     "WHERE status='done' AND COALESCE(confirmed_at,'')=''")
 
 
 def init_db() -> None:
@@ -1387,9 +1411,12 @@ def _notif_public(row: dict, read: bool = False) -> dict:
         "popup": bool(row.get("popup")),
         "created_at": row.get("created_at") or "",
         "read": bool(read),
-        # 仅「待审核」类消息会填：对应 project_audits 的 id 与当前状态
+        # 仅审核类消息（audit_request / audit_done）会填：对应 project_audits 的 id 与当前状态
         "audit_id": 0,
-        "audit_pending": False,
+        "audit_status": "",
+        "audit_pending": False,       # 还在等审核员复核
+        "audit_open": False,          # 流程没走完（待审核 或 待复审）
+        "audit_need_confirm": False,  # 已复核，等管理员点「复审通过」
         # sticky = 「粘住不放」：项目还没审核完成时，这条提醒永远按未读渲染、角标也照常计数
         "sticky": False,
         # superseded = 同一项目更新的那轮提醒已经来了，这条是上一轮的历史记录
@@ -1398,40 +1425,56 @@ def _notif_public(row: dict, read: bool = False) -> dict:
 
 
 def _annotate_audits(items: list) -> list:
-    """给「待审核」消息补上 audit_id / audit_pending / sticky。
+    """给两类审核消息补上当前审核单的状态。
 
-    ★ sticky（待审核项目的「请审核」提醒）：点过、点过全部已读、清空过都不算数，
-    前端仍按未读渲染，角标也继续计数 —— 只有点「审核完成」才取消。
+    覆盖 category：
+      · audit_request（发给审核员「请审核」）→ 挂 audit_id / audit_pending / sticky
+      · audit_done（发给管理员「请复审」）  → 挂 audit_id / audit_status / audit_open，
+        前端据此决定要不要显示「复审通过」按钮。复审这件事以前没有状态，
+        消息只是一句空话；现在它挂在审核单的 audited 状态上。
+
+    ★ sticky（只有「请审核」）：点过、点过全部已读、清空过都不算数，
+    前端仍按未读渲染，角标也继续计数 —— 只有审核员点「审核完成」才取消。
     目的：消息多的时候不遗漏待审核项目。
     ★ 同一项目可能有多轮提醒（审核完成后又被修改、重新结项 → 又发一条）。
       只让**最新那条**挂当前审核单与 sticky，旧的那条标 superseded ——
       否则旧消息会被新一轮的 pending 单重新点亮，看起来像「重复待办」。
+      两类消息**各自**判最新：管理员那条「请复审」不该被审核员那条挤掉。
     """
+    cats = (NOTIF_AUDIT_REQUEST, NOTIF_AUDIT_DONE)
     latest = {}
     for x in items:
-        if x.get("category") != NOTIF_AUDIT_REQUEST:
+        if x.get("category") not in cats:
             continue
-        k = (x["ptype"], x["code"])
+        k = (x["category"], x["ptype"], str(x["code"] or "").upper())
         if k not in latest or x["id"] > latest[k]:
             latest[k] = x["id"]
     if not latest:
         return items
     amap = audit_map()
     for x in items:
-        if x.get("category") != NOTIF_AUDIT_REQUEST:
+        if x.get("category") not in cats:
             continue
-        k = (x["ptype"], x["code"])
+        k = (x["category"], x["ptype"], str(x["code"] or "").upper())
         if x["id"] != latest.get(k):
-            # 上一轮的提醒：那一轮已经审过了，别再拿新单点亮它
+            # 上一轮的提醒：那一轮已经处理过了，别再拿新单点亮它
             x["superseded"] = True
             continue
-        a = amap.get(k)
-        if a:
-            x["audit_id"] = a["id"]
-            x["audit_pending"] = a["status"] == "pending"
+        a = amap.get((x["ptype"], str(x["code"] or "").upper()))
+        if not a:
+            continue
+        st = a["status"]
+        x["audit_id"] = a["id"]
+        x["audit_status"] = st
+        x["audit_pending"] = st == AUDIT_PENDING
+        x["audit_open"] = st in AUDIT_OPEN
+        x["audit_need_confirm"] = st == AUDIT_AUDITED
+        if x["category"] == NOTIF_AUDIT_REQUEST:
             x["sticky"] = bool(x["audit_pending"])
-            if a.get("auditor_name"):
-                x["audit_auditor"] = a["auditor_name"]
+        if a.get("auditor_name"):
+            x["audit_auditor"] = a["auditor_name"]
+        if a.get("confirmer_name"):
+            x["audit_confirmer"] = a["confirmer_name"]
     return items
 
 
@@ -1561,13 +1604,17 @@ def notif_unread_count(user_id: int, roles, platform: str = "",
 
     ★ 审核员的「请审核」提醒**恒算未读**：只要项目还是 pending，这条消息无论
     点过、点过「全部已读」、还是清空过消息中心（见 hide_notifications），角标都不消，
-    只有点「审核完成」把 project_audits 置成 done 才归零。消息多时不遗漏待审核项目。
-    ★ can_audit 时再补上「压根没有提醒消息」的 pending 项目（例如结项那会儿还没有
-    审核员，后来才被授予审核权限），否则红点不会亮、工作台里的待办就容易被忘掉。
+    只有审核员点「审核完成」把 project_audits 置成 audited 才归零。消息多时不遗漏待审核项目。
+    ★ can_audit / 管理员的「兜底补漏」：
+      · 审核员 → 补上「压根没有提醒消息」的 pending 项目（例如结项那会儿还没有
+        审核员，后来才被授予审核权限），否则红点不会亮；
+      · 管理员 → 补上还没人复审的 audited 项目（旧库迁移过来的那批「已审核完成，
+        请复审」也在此列），否则复审这件事同样会从红点里溜走。
     """
     if isinstance(roles, str):
         roles = [roles]
     roles = [r for r in (roles or []) if r] or [ROLE_USER]
+    is_admin = ROLE_ADMIN in roles
     ph = ",".join("?" * len(roles))
     with tx() as conn:
         n = conn.execute(
@@ -1578,14 +1625,17 @@ def notif_unread_count(user_id: int, roles, platform: str = "",
             f"  AND {_plat_where('n', platform)} "
             f"  AND (r.notification_id IS NULL OR {_sticky_audit_cond('n')})",
             [user_id] + roles + [_plat_arg(platform), NOTIF_AUDIT_REQUEST]).fetchone()["n"]
-        if not can_audit:
+        if not (is_admin or can_audit):
             return n
+        # 管理员数「待复审」，审核员数「待审核」
+        want_status = AUDIT_AUDITED if is_admin else AUDIT_PENDING
+        want_cat = NOTIF_AUDIT_DONE if is_admin else NOTIF_AUDIT_REQUEST
         miss = conn.execute(
-            f"SELECT COUNT(*) n FROM project_audits a WHERE a.status='pending' "
+            f"SELECT COUNT(*) n FROM project_audits a WHERE a.status=? "
             f"AND NOT EXISTS (SELECT 1 FROM notifications n "
             f"  WHERE n.category=? AND n.ptype=a.ptype AND UPPER(n.code)=UPPER(a.code) "
             f"  AND n.target_role IN ({ph}) AND {_plat_where('n', platform)})",
-            [NOTIF_AUDIT_REQUEST] + roles + [_plat_arg(platform)]).fetchone()["n"]
+            [want_status, want_cat] + roles + [_plat_arg(platform)]).fetchone()["n"]
     return int(n) + int(miss)
 
 def notif_pending_popups(user_id: int, roles, limit: int = 20,
@@ -1846,7 +1896,26 @@ def delete_broadcast(bid: int) -> bool:
 
 
 # ================================================================== 结项审核
+# 状态机（两段式）：
+#   pending --审核员「审核完成」--> audited --管理员「复审通过」--> done
+#   pending / audited --项目退出已完成 / 退回返工--> void
+#   内容变更（平台完成情况变过）→ upsert_audit 重置回 pending，重新走一遍。
+AUDIT_PENDING = "pending"
+AUDIT_AUDITED = "audited"
+AUDIT_DONE = "done"
+AUDIT_VOID = "void"
+AUDIT_STATUS_NAME = {
+    AUDIT_PENDING: "待审核",
+    AUDIT_AUDITED: "已复核待复审",
+    AUDIT_DONE: "已复审通过",
+    AUDIT_VOID: "已撤回（项目退回未完成）",
+}
+# 「还没处理完」的状态：审核员看待办只认 pending，管理员再加上待复审
+AUDIT_OPEN = (AUDIT_PENDING, AUDIT_AUDITED)
+
+
 def _audit_public(row: dict) -> dict:
+    st = row.get("status") or AUDIT_PENDING
     return {
         "id": row["id"],
         "ptype": row.get("ptype") or "",
@@ -1854,20 +1923,26 @@ def _audit_public(row: dict) -> dict:
         "code": row.get("code") or "",
         "name": row.get("name") or "",
         "project_id": int(row.get("project_id") or 0),
-        "status": row.get("status") or "pending",
-        "status_name": {"pending": "待审核", "done": "已审核",
-                        "void": "已撤回（项目退回未完成）"}.get(row.get("status"), "待审核"),
+        "status": st,
+        "status_name": AUDIT_STATUS_NAME.get(st, AUDIT_STATUS_NAME[AUDIT_PENDING]),
+        # 还在流程里（待审核 或 待复审）→ 前端要给出对应的按钮
+        "open": st in AUDIT_OPEN,
+        "need_confirm": st == AUDIT_AUDITED,
         "auditor_id": int(row.get("auditor_id") or 0),
         "auditor_name": row.get("auditor_name") or "",
+        "confirmer_id": int(row.get("confirmer_id") or 0),
+        "confirmer_name": row.get("confirmer_name") or "",
         "created_at": row.get("created_at") or "",
         "reviewed_at": row.get("reviewed_at") or "",
+        "confirmed_at": row.get("confirmed_at") or "",
     }
 
 
 def upsert_audit(ptype: str, code: str, project_id: int = 0, name: str = "") -> dict:
     """项目结项 → 生成/重置一条待审核记录（同一项目只保留一条）。
 
-    先取消勾选再重新勾上（重新结项）时会重置成 pending，审核人信息清空。
+    先取消勾选再重新勾上（重新结项）、或已复核/已复审后内容又变了（复核争议），
+    都会重置成 pending，审核人 / 复审人信息一并清空，重新走一遍两段式。
     """
     ptype = (ptype or "").strip()
     code = str(code or "").strip().upper()
@@ -1876,11 +1951,13 @@ def upsert_audit(ptype: str, code: str, project_id: int = 0, name: str = "") -> 
     with tx() as conn:
         conn.execute(
             "INSERT INTO project_audits(ptype,code,project_id,name,status,"
-            "auditor_id,auditor_name,created_at,reviewed_at) "
-            "VALUES(?,?,?,?,'pending',0,'',?,'') "
+            "auditor_id,auditor_name,created_at,reviewed_at,"
+            "confirmer_id,confirmer_name,confirmed_at) "
+            "VALUES(?,?,?,?,'pending',0,'',?,'',0,'','') "
             "ON CONFLICT(ptype,code) DO UPDATE SET "
             "  project_id=excluded.project_id, name=excluded.name, status='pending', "
-            "  auditor_id=0, auditor_name='', created_at=excluded.created_at, reviewed_at=''",
+            "  auditor_id=0, auditor_name='', created_at=excluded.created_at, reviewed_at='', "
+            "  confirmer_id=0, confirmer_name='', confirmed_at=''",
             (ptype, code, int(project_id or 0), (name or "").strip(), _now()))
         row = conn.execute(
             "SELECT * FROM project_audits WHERE ptype=? AND code=?", (ptype, code)).fetchone()
@@ -1903,18 +1980,30 @@ def get_audit_by(ptype: str, code: str):
 
 
 def audit_map() -> dict:
-    """{(ptype, code): {id, status, auditor_name}} 一次取全，供通知列表打标。"""
+    """{(ptype, CODE): {id, status, auditor_name, confirmer_name}} 一次取全，供通知列表打标。
+
+    code 一律按大写做键 —— 通知里存的编号大小写不一定和审核单一致。
+    """
     with tx() as conn:
-        rows = conn.execute("SELECT id, ptype, code, status, auditor_name FROM project_audits").fetchall()
-    return {(r["ptype"], r["code"]): {"id": r["id"], "status": r["status"],
-                                      "auditor_name": r["auditor_name"] or ""} for r in rows}
+        rows = conn.execute("SELECT id, ptype, code, status, auditor_name, confirmer_name "
+                            "FROM project_audits").fetchall()
+    return {(r["ptype"], str(r["code"] or "").upper()):
+            {"id": r["id"], "status": r["status"],
+             "auditor_name": r["auditor_name"] or "",
+             "confirmer_name": r["confirmer_name"] or ""} for r in rows}
+
+
+def _audit_where(status: str):
+    """审核单查询条件。status='open' = 待审核 + 待复审（还没走完流程）。"""
+    if not status:
+        return "", []
+    if status == "open":
+        return "WHERE status IN (?,?)", [AUDIT_PENDING, AUDIT_AUDITED]
+    return "WHERE status=?", [str(status)]
 
 
 def list_audits(status: str = "pending", limit: int = 200) -> list:
-    where, args = "", []
-    if status:
-        where = "WHERE status=?"
-        args.append(status)
+    where, args = _audit_where(status)
     with tx() as conn:
         rows = conn.execute(
             f"SELECT * FROM project_audits {where} ORDER BY id DESC LIMIT ?",
@@ -1922,31 +2011,43 @@ def list_audits(status: str = "pending", limit: int = 200) -> list:
     return [_audit_public(dict(r)) for r in rows]
 
 
-def void_audit(ptype: str, code: str) -> int:
-    """撤回待审核单：项目退出「已完成」状态（取消勾选 / 复核不通过退回返工）时用。
+def list_open_audits(is_admin: bool = False, limit: int = 200) -> list:
+    """「待我处理」清单。
 
-    只动 pending；已审核（done）的历史记录保留。否则「待审核」里会一直挂着一个
-    根本还没做完的项目，审核员点「审核完成」也说不通。
+    ★ 审核员只算 pending（他复核完就交出去了）；
+      管理员算 pending + audited —— 前者是替审核员兜底（还没配审核员时也能自己审），
+      后者才是他真正的待办「复审」。早期只数 pending，于是审核员一点「审核完成」，
+      管理员那边的待审核统计立刻掉到 0，可「请复审」的提醒还挂在消息中心里。
+    """
+    return list_audits("open" if is_admin else AUDIT_PENDING, limit=limit)
+
+
+def void_audit(ptype: str, code: str) -> int:
+    """撤回审核单：项目退出「已完成」状态（取消勾选 / 复核不通过退回返工）时用。
+
+    待审核与待复审都要撤 —— 项目都没做完，管理员点「复审通过」更说不通。
+    已复审（done）的历史记录保留。
     """
     with tx() as conn:
         cur = conn.execute(
-            "UPDATE project_audits SET status='void', reviewed_at=? "
-            "WHERE ptype=? AND UPPER(code)=UPPER(?) AND status='pending'",
-            (_now(), (ptype or "").strip(), str(code or "").strip()))
+            "UPDATE project_audits SET status=?, reviewed_at=? "
+            "WHERE ptype=? AND UPPER(code)=UPPER(?) AND status IN (?,?)",
+            (AUDIT_VOID, _now(), (ptype or "").strip(), str(code or "").strip(),
+             AUDIT_PENDING, AUDIT_AUDITED))
         return int(cur.rowcount or 0)
 
 
 def count_audits(status: str = "pending") -> int:
-    where, args = "", []
-    if status:
-        where = "WHERE status=?"
-        args.append(status)
+    where, args = _audit_where(status)
     with tx() as conn:
         return conn.execute(f"SELECT COUNT(*) n FROM project_audits {where}", args).fetchone()["n"]
 
 
-def complete_audit(aid: int, auditor: dict):
-    """审核员复核完成：标记 done 并记下审核人。已审核过则返回 None（避免重复通知）。
+def complete_audit(aid: int, auditor: dict, final: bool = False):
+    """审核员复核完成。已处理过则返回 None（避免重复通知 / 重复开单）。
+
+    final=False → status='audited'，交回管理员复审（管理员的消息中心会多一条「请复审」）；
+    final=True  → 管理员自己点的「审核完成」，一步到位 done（不给自己发复审提醒）。
 
     ⚠️ auditor_name 存的是**姓名**（见 person_label）；账号没填姓名时存「账号 xxx」，
     不存登录名 —— 消息中心里显示的是「✅ 已审核（某某某）」。
@@ -1957,12 +2058,43 @@ def complete_audit(aid: int, auditor: dict):
         if not row:
             return None
         row = dict(row)
-        if row.get("status") == "done":
+        if (row.get("status") or AUDIT_PENDING) != AUDIT_PENDING:
+            return None
+        now = _now()
+        uid = int(auditor.get("id") or 0)
+        who = person_label(auditor)
+        if final:
+            conn.execute(
+                "UPDATE project_audits SET status=?, auditor_id=?, auditor_name=?, "
+                "reviewed_at=?, confirmer_id=?, confirmer_name=?, confirmed_at=? WHERE id=?",
+                (AUDIT_DONE, uid, who, now, uid, who, now, row["id"]))
+        else:
+            conn.execute(
+                "UPDATE project_audits SET status=?, auditor_id=?, auditor_name=?, "
+                "reviewed_at=? WHERE id=?",
+                (AUDIT_AUDITED, uid, who, now, row["id"]))
+        new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (row["id"],)).fetchone())
+    return _audit_public(new)
+
+
+def confirm_audit(aid: int, confirmer: dict):
+    """管理员复审通过：audited → done，记下复审人。
+
+    只认 audited —— pending 说明审核员还没复核（管理员想直接审请走 complete_audit(final=True)），
+    done/void 都不该再被点。状态不对返回 None，由接口层给出提示。
+    """
+    confirmer = confirmer or {}
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM project_audits WHERE id=?", (int(aid or 0),)).fetchone()
+        if not row:
+            return None
+        row = dict(row)
+        if (row.get("status") or "") != AUDIT_AUDITED:
             return None
         conn.execute(
-            "UPDATE project_audits SET status='done', auditor_id=?, auditor_name=?, reviewed_at=? "
-            "WHERE id=?",
-            (int(auditor.get("id") or 0), person_label(auditor),
+            "UPDATE project_audits SET status=?, confirmer_id=?, confirmer_name=?, "
+            "confirmed_at=? WHERE id=?",
+            (AUDIT_DONE, int(confirmer.get("id") or 0), person_label(confirmer),
              _now(), row["id"]))
         new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (row["id"],)).fetchone())
     return _audit_public(new)
