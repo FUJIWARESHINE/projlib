@@ -353,8 +353,9 @@ VIEWS.browse = async (root) => {
           <option value="type"${(B.group || "type") === "type" ? " selected" : ""}>按类型分组</option>
           <option value="all"${B.group === "all" ? " selected" : ""}>全部混排</option>
         </select>
-        <select class="select" id="sortSel" style="width:132px" title="排序依据">
+        <select class="select" id="sortSel" style="width:150px" title="排序依据；默认档（按编号 / 正序）下返修分组按加入日期排，新加入的在最上方">
           <option value="code"${(B.sort || "code") === "code" ? " selected" : ""}>按编号排</option>
+          <option value="created"${B.sort === "created" ? " selected" : ""}>按加入日期</option>
           <option value="src"${B.sort === "src" ? " selected" : ""}>按录入顺序</option>
         </select>
         <select class="select" id="ordSel" style="width:104px" title="排序方向">
@@ -371,7 +372,9 @@ VIEWS.browse = async (root) => {
           <button class="btn btn-primary btn-sm" id="btnNew">新增项目</button>`
         : `<span class="ro-tag">只读浏览</span>`}
       </div>
-      <div class="hint" style="padding:0 20px 12px">拖动表头右边界可调整列宽（双击恢复该列默认宽度），列宽按浏览器记住。</div>
+      <div class="hint" style="padding:0 20px 12px">拖动表头右边界可调整列宽（双击恢复该列默认宽度），列宽按浏览器记住。
+        默认排序（按编号 / 正序）下，<b>返修分组按「加入日期」排，新加入的返修项目在最上方</b>；
+        想全部按入库时间排，把「排序依据」切成「按加入日期」。</div>
       <div id="tableWrap"></div>
     </div>`;
 
@@ -493,7 +496,16 @@ VIEWS.browse = async (root) => {
   $("#platSel").addEventListener("change", () => { B.page = 1; load(); });
   $("#stSel").addEventListener("change", () => { B.page = 1; load(); });
   $("#grpSel").addEventListener("change", () => { savePref("browse_group", $("#grpSel").value); B.page = 1; load(); });
-  $("#sortSel").addEventListener("change", () => { savePref("browse_sort", $("#sortSel").value); B.page = 1; load(); });
+  $("#sortSel").addEventListener("change", () => {
+    // 「按加入日期」的用途就是看最新进来的，从默认正序切过来时顺手翻成倒序，
+    // 免得点完发现最老的在最上面；想按时间正序仍可在右边再切回来。
+    if ($("#sortSel").value === "created" && $("#ordSel").value === "asc") {
+      $("#ordSel").value = "desc";
+      savePref("browse_order", "desc");
+    }
+    savePref("browse_sort", $("#sortSel").value);
+    B.page = 1; load();
+  });
   $("#ordSel").addEventListener("change", () => { savePref("browse_order", $("#ordSel").value); B.page = 1; load(); });
   $("#btnColReset").addEventListener("click", () => {
     Object.keys(COL_DEF).forEach((k) => { C.w[k] = COL_DEF[k]; delete C.man[k]; });

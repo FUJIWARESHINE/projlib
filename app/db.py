@@ -325,6 +325,8 @@ def _migrate(conn) -> None:
        系统里从来没有「复审」这一步，所以这些单子实际上都还没被管理员复审过。
        判断依据是 confirmed_at 为空：新版本复审/管理员直接审核都会写它，
        因此这条 UPDATE 天然幂等，不会把新的 done 又翻回去。
+    ⑥ 回填 projects.created_at（2026-11-02 新增「按加入日期」排序）：
+       早期批量导入只写了 updated_at，这里用它兜底，只填空值、幂等。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     if "seq" not in cols:
@@ -355,6 +357,16 @@ def _migrate(conn) -> None:
             conn.execute("ALTER TABLE project_audits ADD COLUMN confirmed_at TEXT")
         conn.execute("UPDATE project_audits SET status='audited' "
                      "WHERE status='done' AND COALESCE(confirmed_at,'')=''")
+    # ⑥ 回填 projects.created_at（2026-11-02 新增「按加入日期」排序）：
+    #    早期版本的批量导入只写了 updated_at，命中 created_at 为空的行。
+    #    用 updated_at 兜底，实在没有就填当前时间；只填空值，天然幂等，
+    #    不会把已有的真实加入时间覆盖掉。
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+    if "created_at" in pcols:
+        conn.execute(
+            "UPDATE projects SET created_at = "
+            "COALESCE(NULLIF(updated_at,''), datetime('now','localtime')) "
+            "WHERE COALESCE(created_at,'') = ''")
 
 
 def init_db() -> None:
@@ -369,9 +381,15 @@ def _now() -> str:
 
 
 # 排序表达式：先按类型分组（真实→加急→库存→返修），再按所选维度
-#   code → 按编号（A99 排在 A100 前面，用长度再字典序，避免字符串比较的坑）
-#   src  → 按源表录入顺序（保序，导入后与 Excel 行序一致）
-_CODE_ORDER = ("UPPER(SUBSTR(code,1,1)) {d}, LENGTH(code) {d}, UPPER(code) {d}")
+#   code    → 按编号（A99 排在 A100 前面，用长度再字典序，避免字符串比较的坑）
+#   created → 按「加入日期」（项目进库时间，见 _JOIN_AT）
+#   src     → 按源表录入顺序（保序，导入后与 Excel 行序一致）
+_CODE_KEYS = ("UPPER(SUBSTR(code,1,1))", "LENGTH(code)", "UPPER(code)")
+
+# 「加入日期」：项目真正进库的时间。早期版本的批量导入只写了 updated_at、
+# 没写 created_at（见 upsert_projects_bulk 的迁移修复），所以这里用 updated_at
+# 兜底，保证老数据也能按日期排，不会整批挤到一端。
+_JOIN_AT = "COALESCE(NULLIF(created_at,''), NULLIF(updated_at,''), '')"
 
 
 def _order_sql(sort: str, direction: str, group: str = "type") -> str:
@@ -380,15 +398,32 @@ def _order_sql(sort: str, direction: str, group: str = "type") -> str:
     group="type" → 先按类型分组（真实→加急→库存→返修），组内再按所选维度；
     group="all"  → 不分组，全局按所选维度排（编号就是唯一坐标，
                    A393 直接排到 393 该在的位置，不管它属于哪个类型）。
+
+    ★ 返修组的例外（默认档才有）：返修是零散补录的返工单，编号常与原型项目重复，
+      按编号排看不出「谁最新」。所以「按编号 + 正序」（也就是默认档）下，
+      分组模式里的返修组改按**加入日期倒序**排，新加入的排在返修组最上方。
+      用户一旦显式改排序（按加入日期 / 按录入顺序 / 倒序），就完全按所选来。
     """
+    grouped = str(group).lower() != "all"
     head = ""
-    if str(group).lower() != "all":
+    if grouped:
         head = ("CASE ptype WHEN 'real' THEN 0 WHEN 'urgent' THEN 1 "
                 "WHEN 'stock' THEN 2 ELSE 3 END, ")
-    if str(sort).lower() == "src":
+    s = str(sort).lower()
+    if s == "created":
+        # 显式按加入日期：所有类型组内都按入库时间（方向由正序 / 倒序决定）
+        return f"ORDER BY {head}{_JOIN_AT} {direction}, id {direction}"
+    if s == "src":
         return f"ORDER BY {head}src_row {direction}, id {direction}"
-    code_part = _CODE_ORDER.format(d=direction)
-    return f"ORDER BY {head}{code_part}, id {direction}"
+    code_part = ", ".join(f"{k} {direction}" for k in _CODE_KEYS)
+    if not grouped or direction != "ASC":
+        return f"ORDER BY {head}{code_part}, id {direction}"
+    # 默认档（分组 + 编号 + 正序）：返修组按加入日期倒序（新的在上），其它组按编号
+    repair_at = f"CASE WHEN ptype='repair' THEN {_JOIN_AT} END DESC"
+    others = ", ".join(
+        f"CASE WHEN ptype='repair' THEN NULL ELSE {k} END {direction}" for k in _CODE_KEYS)
+    return (f"ORDER BY {head}{repair_at}, {others}, "
+            f"CASE WHEN ptype='repair' THEN id END DESC, id {direction}")
 
 
 def list_projects(ptype: str = "", search: str = "", platform: str = "",
@@ -428,7 +463,8 @@ def list_projects(ptype: str = "", search: str = "", platform: str = "",
                 args.append(status)
     sql_where = ("WHERE " + " AND ".join(where)) if where else ""
     # 排序：默认按类型分组 + 编号（A99 < A100，符合项目库直觉）；
-    # sort="src" 按源表录入顺序；group="all" 不分组、全局混排。
+    # sort="created" 按加入日期（入库时间）、sort="src" 按源表录入顺序；
+    # group="all" 不分组、全局混排。默认档下返修组按加入日期倒序（见 _order_sql）。
     dir_sql = "DESC" if str(order).lower() == "desc" else "ASC"
     order_sql = _order_sql(sort, dir_sql, group)
     with tx() as conn:
@@ -580,11 +616,14 @@ def upsert_projects_bulk(rows: list) -> tuple:
                 )
                 updated += 1
             else:
-                collist = ", ".join(("ptype", "code", "disc", "seq") + cols + ("updated_at",))
-                marks = ", ".join("?" * (4 + len(cols) + 1))
+                # created_at 必须一起写：它才是「加入日期」（导出 / 按日期排序都用它）。
+                # 早先这里漏了，导入进来的项目 created_at 为空，按日期排只能靠 updated_at 兜底。
+                collist = ", ".join(("ptype", "code", "disc", "seq") + cols
+                                    + ("created_at", "updated_at"))
+                marks = ", ".join("?" * (4 + len(cols) + 2))
                 conn.execute(
                     f"INSERT INTO projects ({collist}) VALUES ({marks})",
-                    [ptype, code, disc, seq] + [fields[k] for k in cols] + [now],
+                    [ptype, code, disc, seq] + [fields[k] for k in cols] + [now, now],
                 )
                 created += 1
                 created_items.append({"ptype": ptype, "code": code, "name": fields["name"]})
