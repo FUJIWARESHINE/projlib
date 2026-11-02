@@ -14,7 +14,10 @@ const state = {
   import: { preview: null, path: "", busy: false },
   month: { mid: 0, detail: null, list: [] },
   notif: { items: [], unread: 0, popups: [], audits: [], canAudit: false,
-           open: false, bannerOpen: false, timer: 0 },
+           open: false, bannerOpen: false, timer: 0,
+           scroll: null,      // 上次看到的滚动位置（{top, anchor, offset}），见 notifScroll 相关函数
+           scrollLock: false, // 程序化恢复滚动时先锁一下，别把记住的位置覆盖成 0
+           scrollT: 0 },
 };
 
 const TYPE_CLASS = { real: "t-real", urgent: "t-urgent", stock: "t-stock", repair: "t-repair" };
@@ -387,9 +390,77 @@ function notifAuditHtml() {
     </div>`;
 }
 
+/* -------------------------------- 消息中心的「看到哪儿了」
+   面板每次刷新（45 秒轮询、切回窗口、标已读、审核完成…）都会重建 innerHTML，
+   一重建 .notif-list 的滚动位置就归零 —— 表现为「滚下去看了几条，点一下别处再回来，
+   又被刷回最上边」。这里把滚动位置记住：
+     · 按账号存 localStorage（刷新页面、关掉再打开都回到上次的位置）；
+     · 除了绝对偏移，还记「最上面那条消息的 id + 它离列表顶部多远」，
+       这样轮询到新消息插到列表最上方时，仍然钉在原来那条，不会被顶下去。 */
+function notifScrollKey() {
+  const uid = (state.me && state.me.id != null) ? state.me.id : "anon";
+  return "notif_scroll." + uid;
+}
+function readNotifScroll() {
+  let v = {};
+  try { v = JSON.parse(loadPref(notifScrollKey(), "{}")) || {}; } catch (e) { v = {}; }
+  return {
+    top: Math.max(0, Number(v.top) || 0),
+    anchor: v.anchor == null ? null : String(v.anchor),
+    offset: Number(v.offset) || 0,
+  };
+}
+function writeNotifScroll(pos) {
+  state.notif.scroll = pos;
+  savePref(notifScrollKey(), JSON.stringify(pos));
+}
+/* 记下当前滚动位置：第一条（哪怕只露出一点）可见消息 + 它相对列表顶部的位置 */
+function captureNotifScroll(list) {
+  if (!list || !list.isConnected) return;
+  const top = list.scrollTop;
+  const lr = list.getBoundingClientRect();
+  const first = $$(".notif-item", list).find((el) => el.getBoundingClientRect().bottom > lr.top + 1);
+  writeNotifScroll(first
+    ? { top, anchor: first.dataset.nid || null,
+        offset: Math.round(first.getBoundingClientRect().top - lr.top) }
+    : { top, anchor: null, offset: 0 });
+}
+/* 重建面板后把滚动位置还原回去（两次 rAF：等布局 / 字体度量稳定后再校一次） */
+function restoreNotifScroll(list) {
+  if (!list) return;
+  // 列表被清空了就重置记忆，免得以后新消息进来还按老偏移定位
+  if (!$$(".notif-item", list).length) {
+    writeNotifScroll({ top: 0, anchor: null, offset: 0 });
+    return;
+  }
+  const pos = state.notif.scroll || { top: 0, anchor: null, offset: 0 };
+  const apply = () => {
+    if (!list.isConnected) return;
+    let want = pos.top;
+    if (pos.anchor) {
+      const el = list.querySelector(`.notif-item[data-nid="${pos.anchor}"]`);
+      if (el) {
+        const lr = list.getBoundingClientRect();
+        want = el.getBoundingClientRect().top - lr.top + list.scrollTop - pos.offset;
+      }
+    }
+    const max = Math.max(0, list.scrollHeight - list.clientHeight);
+    list.scrollTop = Math.max(0, Math.min(Math.round(want), max));
+  };
+  state.notif.scrollLock = true;      // 还原过程中的 scroll 事件不算「用户滚动」
+  apply();
+  requestAnimationFrame(() => {
+    apply();
+    requestAnimationFrame(() => { state.notif.scrollLock = false; });
+  });
+}
+
 function renderNotifPanel() {
   const root = $("#notifRoot");
   if (!root) return;
+  if (!state.notif.scroll) state.notif.scroll = readNotifScroll();
+  // 重建之前先把「看到哪儿了」存下来（关闭面板、轮询刷新都走这里）
+  captureNotifScroll($(".notif-list", root));
   if (!state.notif.open) {
     // 只清面板，别把正在显示的横幅一起清掉
     const p = $("#notifPanel", root);
@@ -424,6 +495,19 @@ function renderNotifPanel() {
           : "管理员新增项目后，这里会收到「项目已入库」提醒；管理员发布的📢全服通告（发给你所在平台的）也会送到这里。"}</div>
     </div>`;
   bindNotifPanel();
+  // 重建完把滚动位置放回去，并持续记录用户滚动（节流写 localStorage）
+  const list = $(".notif-list", root);
+  restoreNotifScroll(list);
+  if (list) {
+    list.addEventListener("scroll", () => {
+      if (state.notif.scrollLock) return;
+      if (state.notif.scrollT) clearTimeout(state.notif.scrollT);
+      state.notif.scrollT = setTimeout(() => {
+        state.notif.scrollT = 0;
+        captureNotifScroll(list);
+      }, 150);
+    }, { passive: true });
+  }
 }
 
 /* 审核完成：复核无误 → 后端置 audited 并通知全体管理员「某某某已审核完成，请复审」。
