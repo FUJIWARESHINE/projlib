@@ -838,6 +838,43 @@ table.tbl-fixed td .price-cell { font-variant-numeric: tabular-nums; }
 table.tbl-fixed td.ops-cell .btn-icon { width: 28px; height: 28px; }
 table.tbl-fixed thead th { position: sticky; }
 
+/* 备注列：完整显示。备注常有很长的说明，以前被 nowrap + 省略号截成一行、
+   鼠标不放上去就看不全；这里改成自动换行（回车/换行也保留），行高随之撑开。 */
+table.tbl-fixed td .note-cell {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.55;
+}
+/* 返修项目的备注：紫色高亮块 + 「返修备注」标签，和返修类型标签同色系，扫一眼就能认出来。
+   其他类型（真实/加急/库存）的备注保持普通样式，不做高亮。 */
+table.tbl-fixed td .note-cell.note-repair {
+  padding: 5px 9px;
+  border-left: 3px solid var(--t-repair-fg);
+  border-radius: 8px;
+  font-weight: 600;
+  color: var(--t-repair-fg);
+  background: var(--t-repair-bg);
+}
+table.tbl-fixed td .note-cell.note-repair::before {
+  content: "返修备注";
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 17px;
+  color: #fff;
+  background: var(--t-repair-fg);
+  vertical-align: 1px;
+}
+html[data-theme="dark"] table.tbl-fixed td .note-cell.note-repair::before {
+  color: #1a1030;
+}
+
 /* 列宽拖拽 */
 .col-rs { position: absolute; top: 0; right: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 4; touch-action: none; }
 .col-rs::after {

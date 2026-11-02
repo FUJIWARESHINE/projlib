@@ -423,6 +423,8 @@ VIEWS.browse = async (root) => {
               // 报价列只显示报价：返修不计价 → —（「要求」统一放备注列，不再重复）
               const price = (r.ptype !== "repair" && r.price) ? money(r.price) : "—";
               const note = r.note || (r.ptype === "repair" ? r.extra : "");
+              // 返修项目只要有备注就高亮显示（返修内容最容易漏看）；其他类型保持普通样式
+              const noteHot = r.ptype === "repair" && !!String(note || "").trim();
               return `<tr data-id="${r.id}">
               <td>${typePill(r.ptype)}</td>
               <td><span class="code-cell">${esc(r.code)}</span>${
@@ -432,7 +434,7 @@ VIEWS.browse = async (root) => {
               <td><span class="name-cell" title="${esc(r.name)}">${esc(r.name)}</span></td>
               ${PLAT_COLS.map((p) => `<td class="plat">${stCell(r.id, p, r[p])}</td>`).join("")}
               <td><span class="price-cell" title="${esc(r.extra)}">${price}</span></td>
-              <td><span class="note-cell" title="${esc(note)}">${esc(note) || "—"}</span></td>
+              <td><span class="note-cell${noteHot ? " note-repair" : ""}" title="${esc(note)}">${esc(note) || "—"}</span></td>
               <td><span class="date-cell">${esc(r.send_date) || "—"}</span></td>
               ${admin ? `<td class="ops-cell">
                 <button class="btn btn-ghost btn-sm btn-icon" data-edit="${r.id}" title="编辑">

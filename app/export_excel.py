@@ -52,6 +52,20 @@ def _safe_name(text: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", str(text or ""))[:40]
 
 
+def _text_lines(text, width: float) -> int:
+    """按列宽粗估一段文字要折几行（中文按 2 个字符宽计，按换行分段）。
+    只用来撑行高 —— 备注/返修要求写长了，固定 20 磅行高在 Excel 里只能看见第一行。"""
+    s = str(text or "")
+    if not s:
+        return 1
+    cap = max(1, int(float(width) * 1.05))     # 一行大约能放下的半角字符数
+    total = 0
+    for seg in s.split("\n"):
+        w = sum(2 if ord(ch) > 127 else 1 for ch in seg)
+        total += max(1, (w + cap - 1) // cap)
+    return max(1, total)
+
+
 def _status_style(cell, value: str) -> None:
     v = (value or "").strip()
     if v == db.ST_DONE:
@@ -279,7 +293,11 @@ def export_all(ptype: str = "") -> str:
                 cell.number_format = "#,##0.00"
             else:
                 cell.alignment = _LEFT
-        ws.row_dimensions[row].height = 20
+        # 行高跟着「报价 / 返修要求」和「备注」里最长的那段走，备注写多长都能看全
+        # （Excel 行高上限 409 磅，超长条目也不会把表撑坏）
+        lines = max(_text_lines(r.get("extra") or "", FULL_WIDTHS[7]),
+                    _text_lines(r.get("note") or "", FULL_WIDTHS[12]))
+        ws.row_dimensions[row].height = max(20, min(409, lines * 14 + 6))
     suffix = f"_{db.TYPE_NAME[ptype]}" if ptype in db.TYPE_NAME else ""
     path = os.path.join(_export_dir(), f"项目库导出{suffix}_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
     wb.save(path)
