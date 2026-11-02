@@ -238,8 +238,9 @@ def _audit_content_changed(before: dict, after: dict) -> bool:
 def _notify_status_change(before: dict, after: dict, user: dict) -> None:
     """项目平台状态写入后的通知分发（项目库列表内联点勾 / 编辑弹窗共用）。
 
-    ① 平台完成（非 ✅ → ✅）：通知全体管理员。
-       **仅普通账户操作时播报** —— 管理员在项目库里替人勾选时不给自己刷屏。
+    ① 单个平台完成（非 ✅ → ✅）：**不再发通知**。
+       以前每勾一个平台就给管理员推一条「XX 平台已完成」，四个平台就是四条，
+       消息中心被刷屏；现在只在整单结项（所有被设计平台都 ✅）时推一条。
     ② 结项 / 复核：写入后项目处于「已完成」状态，且**平台完成情况确实变了**，才建单。
        · 首次结项（未完成 → 完成）→ 建单 + 通知；
        · 已复核（audited，等管理员复审）/ 已复审（done）之后又改了平台完成情况
@@ -262,20 +263,7 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
     ptype = after.get("ptype") or ""
     type_label = db.TYPE_NAME.get(ptype, ptype)
 
-    # ① 各平台「未完成 → ✅」的增量播报（管理员自己操作时不发）
-    if not auth.is_admin(user):
-        for key, label in db.PLATFORMS:
-            if (after.get(key) or "").strip() != db.ST_DONE:
-                continue
-            if (before.get(key) or "").strip() == db.ST_DONE:
-                continue
-            _safe_notify(db.add_notification,
-                         db.NOTIF_PLATFORM_DONE, db.ROLE_ADMIN,
-                         f"{code}项目{label}平台已完成",
-                         f"{type_label}｜{name}" if name else type_label,
-                         ptype=ptype, code=code, platform=key,
-                         project_id=pid, created_by=uid)
-
+    # ① 单个平台完成不再单独播报 —— 只等整单结项时推一条（见下方 ②）
     # ② 结项 / 复核：只认「写入后已完成」+「内容确实变过」
     st_before = db.project_status(before)
     st_after = db.project_status(after)

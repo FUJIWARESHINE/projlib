@@ -201,7 +201,7 @@ CREATE INDEX IF NOT EXISTS ix_worklogs_user_date ON worklogs(user_id, log_date);
 
 -- 站内通知（消息中心）：按「角色」广播，已读状态按用户存。
 --   target_role='user'   → 发给所有普通账户（管理员新增项目入库时）
---   target_role='admin'  → 发给所有管理员（实验员勾选平台完成 / 项目结项时）
+--   target_role='admin'  → 发给所有管理员（项目结项 / 审核完成时）
 --   target_platform      → 按平台再收窄一层受众（**仅全服通告用**，见下）
 --   popup=1 → 目标用户登录后弹「闪烁流光横幅」；popup=0 → 只在消息中心显示未读。
 -- 受众 = target_role 命中的角色 **且** 平台命中 target_platform：
@@ -211,7 +211,7 @@ CREATE INDEX IF NOT EXISTS ix_worklogs_user_date ON worklogs(user_id, log_date);
 --      通告是发给实验员干活的，管理员通过「全服通告」页面查看已发记录即可。
 CREATE TABLE IF NOT EXISTS notifications(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  category TEXT NOT NULL,                 -- project_in 项目入库 / platform_done 平台完成 / project_done 项目结项
+  category TEXT NOT NULL,                 -- project_in 项目入库 / platform_done 平台完成（历史） / project_done 项目结项
   target_role TEXT NOT NULL DEFAULT 'user',
   target_platform TEXT DEFAULT '',        -- 受众平台（逗号分隔，'' = 不限平台）；全服通告用
   title TEXT NOT NULL DEFAULT '',         -- 主文案（消息中心与横幅都用它）
@@ -1373,11 +1373,12 @@ def worklog_months(user_id: int) -> list:
 # 规则（2026-10-14 与用户确认）：
 #   · 管理员新增「真实 / 加急 / 返修」项目 → 通知所有普通账户，登录时弹流光横幅；
 #     「库存」项目只进消息中心（未读），不弹横幅。
-#   · 普通账户把某项目某平台勾成 ✅ → 通知所有管理员；
-#     若该项目所有被设计平台都完成 → 再补一条「已结项，请审核」。
+#   · 单个平台勾成 ✅ → **不发通知**（2026-11-02 调整：避免逐平台刷屏）；
+#     只有该项目所有被设计平台都完成（= 结项）→ 才给管理员与审核员各推一条
+#     「已结项，请审核」。
 # 已读状态按用户存（notification_reads），所以「谁看过」互不影响。
 NOTIF_PROJECT_IN = "project_in"        # 项目入库
-NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成
+NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成（历史分类：已不再产生，仅保留旧数据展示）
 NOTIF_PROJECT_DONE = "project_done"    # 项目结项（待审核）
 NOTIF_AUDIT_REQUEST = "audit_request"  # 结项待审核（发给有审核权限的普通账户）
 NOTIF_AUDIT_DONE = "audit_done"        # 审核完成（发给管理员）
