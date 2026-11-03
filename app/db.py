@@ -1374,14 +1374,18 @@ def worklog_months(user_id: int) -> list:
 #   · 管理员新增「真实 / 加急 / 返修」项目 → 通知所有普通账户，登录时弹流光横幅；
 #     「库存」项目只进消息中心（未读），不弹横幅。
 #   · 单个平台勾成 ✅ → **不发通知**（2026-11-02 调整：避免逐平台刷屏）；
-#     只有该项目所有被设计平台都完成（= 结项）→ 才给管理员与审核员各推一条
-#     「已结项，请审核」。
+#     只有该项目所有被设计平台都完成（= 结项）才发，且三类收件人分工明确
+#     （2026-11-03 调整）：
+#       project_done 项目结项 → 管理员 + 审核员都收，纯告知、不弹横幅；
+#       audit_request 审核通知 → 只发审核员，弹横幅、未审核完成前一直算未读；
+#       audit_done 复审通知    → 只发管理员，审核员点「审核完成」时发出。
+#     即：管理员不再收「已结项，请审核」，他的待办只有「复审」。
 # 已读状态按用户存（notification_reads），所以「谁看过」互不影响。
 NOTIF_PROJECT_IN = "project_in"        # 项目入库
 NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成（历史分类：已不再产生，仅保留旧数据展示）
-NOTIF_PROJECT_DONE = "project_done"    # 项目结项（待审核）
-NOTIF_AUDIT_REQUEST = "audit_request"  # 结项待审核（发给有审核权限的普通账户）
-NOTIF_AUDIT_DONE = "audit_done"        # 审核完成（发给管理员）
+NOTIF_PROJECT_DONE = "project_done"    # 项目结项（管理员 + 审核员，纯告知）
+NOTIF_AUDIT_REQUEST = "audit_request"  # 结项待审核（只发有审核权限的普通账户）
+NOTIF_AUDIT_DONE = "audit_done"        # 审核完成 → 请复审（只发管理员）
 NOTIF_BROADCAST = "broadcast"          # 全服通告（管理员手动发布，可按平台定向）
 NOTIF_CATEGORY_NAME = {
     NOTIF_PROJECT_IN: "项目入库",
@@ -2051,14 +2055,21 @@ def list_audits(status: str = "pending", limit: int = 200) -> list:
     return [_audit_public(dict(r)) for r in rows]
 
 
-def list_open_audits(is_admin: bool = False, limit: int = 200) -> list:
+def list_open_audits(is_admin: bool = False, limit: int = 200,
+                     review_only: bool = False) -> list:
     """「待我处理」清单。
 
     ★ 审核员只算 pending（他复核完就交出去了）；
       管理员算 pending + audited —— 前者是替审核员兜底（还没配审核员时也能自己审），
       后者才是他真正的待办「复审」。早期只数 pending，于是审核员一点「审核完成」，
       管理员那边的待审核统计立刻掉到 0，可「请复审」的提醒还挂在消息中心里。
+    ★ review_only=True：管理员的消息中心工作台只要「待复审」（audited）。
+      结项那一刻他已经收到「XX项目已结项，请处理」这条通知，再给他一张
+      「已结项，待审核」卡片就是同一件事在两处出现，看着乱（2026-11-03 用户反馈）。
+      「待审核项目」弹窗 / 审核页仍走默认口径（pending + audited），不丢兜底。
     """
+    if is_admin and review_only:
+        return list_audits(AUDIT_AUDITED, limit=limit)
     return list_audits("open" if is_admin else AUDIT_PENDING, limit=limit)
 
 

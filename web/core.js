@@ -250,8 +250,10 @@ function alertDialog(title, bodyHtml, okText = "知道了") {
    数据来自 /api/notifications。通知按**角色**广播（普通账户一套 / 管理员一套），
    已读状态按**用户**存 —— 谁看过互不影响，看过之后就不再弹横幅。
      · 项目入库（普通账户收）：真实/加急/返修 → 登录弹「流光横幅」；库存只进消息中心。
-     · 项目结项（管理员收）：只在消息中心显示未读，不弹窗。
-     单个平台完成不再推送，只有整单结项（所有被设计平台都 ✅）才发一条。
+     · 项目结项（管理员 + 审核员都收）：纯告知，只进消息中心，不弹窗。
+     · 待审核（只发审核员）：弹横幅，未点「审核完成」前一直算未读。
+     · 审核完成（只发管理员）：审核员复核完才发，管理员点「复审通过」后才收掉。
+     单个平台完成不再推送，只有整单结项（所有被设计平台都 ✅）才发。
      platform_done 仅用于展示历史数据。 */
 const NOTIF_ICON = { project_in: "📦", platform_done: "✅", project_done: "🏁",
                      audit_request: "🔎", audit_done: "🛡️", broadcast: "📢" };
@@ -303,7 +305,7 @@ function renderNotifBadge() {
   b.title = n > 0
     ? (state.notif.canAudit && n > 0
         ? (isAdmin()
-            ? `${n} 条未读（含待审核 / 待复审，项目走完「复审通过」前红点不会消）`
+            ? `${n} 条未读（含待复审：审核员复核完成后会提醒你复审）`
             : `${n} 条未读（含待审核，点「审核完成」后红点才消）`)
         : `${n} 条未读`)
     : "";
@@ -366,7 +368,8 @@ function notifItemHtml(n) {
 }
 
 /* 「待我处理」区块：审核 / 复审的工作台。比通知更可靠 —— 只要审核单还没走完就在这儿。
-   审核员看到的是待他复核（pending）；管理员还能看到已复核待复审（audited）的那些。 */
+   审核员看到的是待他复核（pending）；管理员**只看待复审**（audited）——
+   结项那一刻他已经在消息里收到「XX项目已结项，请处理」，这里再列一遍就重复了。 */
 function notifAuditHtml() {
   const list = state.notif.audits || [];
   if (!state.notif.canAudit || !list.length) return "";
@@ -374,7 +377,7 @@ function notifAuditHtml() {
   const admin = isAdmin();
   return `
     <div class="notif-audit">
-      <div class="na-head">${admin ? "待我处理（待审核 / 待复审）" : "待我审核"} <span class="np-pill">${list.length} 个</span></div>
+      <div class="na-head">${admin ? "待我复审" : "待我审核"} <span class="np-pill">${list.length} 个</span></div>
       ${shown.map((a) => {
         const need = a.status === "audited";
         return `

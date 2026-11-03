@@ -252,6 +252,17 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
        · 只改发送日期 / 项目名 / 报价 / 备注 / 孙徐审核标记 → **不算变更，不重开审核**；
          原样保存或已经 pending → 同样不动，避免重复刷单。
        **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要进审核流程。
+    ③ 收件人分工（2026-11-03 调整）：
+       · 项目结项通知（project_done）→ **管理员 + 审核员**各一条，纯告知、不弹横幅。
+         管理员那条固定是「XX项目已结项，请处理」，**不出现任何审核字眼**
+         （以前写「已结项，请审核」，他会误以为要自己去审）；
+       · 审核通知（audit_request）    → **只发审核员**，弹横幅、未审核完成前一直算未读；
+       · 复审通知（audit_done）       → **只发管理员**，在审核员点「审核完成」时才发
+         （见 api_audit_done）—— 管理员这条链路上只做复审。
+       另外，消息中心「待我处理」工作台里管理员只看「待复审」（见 api_notifications），
+       所以结项那一刻管理员只会收到**一条**消息，不会出现「待审核卡片 + 通知」两条。
+       例外：全站一个审核员都没有时，审核通知兜底发给管理员，否则这条待审核单
+       没人能处理（消息中心的工作台也不再给他列 pending）。
     """
     if after is None:
         return
@@ -280,19 +291,40 @@ def _notify_status_change(before: dict, after: dict, user: dict) -> None:
     if cur and cur.get("status") == "pending":
         return                       # 已经在待审核里，别重复建单/刷通知
     reopened = bool(cur)             # 有历史单（已审核）→ 这一轮是复核
+    has_auditor = db.has_auditor()
 
     done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st_after["done"])
+    # 结项告知的正文只有「类型 / 项目名 / 完成平台」—— 一点审核字眼都不带，
+    # 审核相关信息（谁去审、怎么点）只出现在审核员那条里。
     body = f"{type_label}｜{name}｜完成平台：{done_labels}"
-    title = f"{code}项目{'内容已变更，请重新审核' if reopened else '已结项，请审核'}"
-    if reopened:
-        body += "｜复核：项目内容有变更，需再次审核"
+    settle_title = f"{code}项目{'内容有变更，已重新结项' if reopened else '已结项'}"
+
+    # ③ 项目结项通知：管理员与审核员都收，纯告知（不弹横幅）。
+    #    管理员那条只写「已结项，请处理」—— 不带「请审核 / 待审核」，他的待办只有「复审」。
     _safe_notify(db.add_notification,
-                 db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN, title, body,
+                 db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
+                 f"{settle_title}，请处理", body,
                  ptype=ptype, code=code, project_id=pid, created_by=uid)
-    _safe_notify(db.upsert_audit, ptype, code, pid, name)
-    if db.has_auditor():
+    if has_auditor:
         _safe_notify(db.add_notification,
-                     db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR, title, body,
+                     db.NOTIF_PROJECT_DONE, db.ROLE_AUDITOR, settle_title, body,
+                     ptype=ptype, code=code, project_id=pid, created_by=uid)
+
+    # ④ 审核通知：**只发审核员**（横幅 + sticky），管理员不再收这条
+    _safe_notify(db.upsert_audit, ptype, code, pid, name)
+    audit_title = f"{code}项目{'内容已变更，请重新审核' if reopened else '已结项，请审核'}"
+    audit_body = body + ("｜复核：项目内容有变更，需再次审核" if reopened else "")
+    audit_body += "｜复核无误后在消息中心点「审核完成」"
+    if has_auditor:
+        _safe_notify(db.add_notification,
+                     db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR, audit_title, audit_body,
+                     ptype=ptype, code=code, project_id=pid, popup=True,
+                     created_by=uid)
+    else:
+        # 兜底：全站还没配审核员 → 只能由管理员自己审，这一条发给他，
+        # 免得待审核单只躺在「待我处理」清单里被漏掉。
+        _safe_notify(db.add_notification,
+                     db.NOTIF_AUDIT_REQUEST, db.ROLE_ADMIN, audit_title, audit_body,
                      ptype=ptype, code=code, project_id=pid, popup=True,
                      created_by=uid)
 
@@ -418,8 +450,9 @@ def api_notifications(query, _b, ctx=None):
         "roles": roles,
         "can_audit": bool(user.get("can_audit")),
         # 有审核权限 / 管理员时带上「待我处理」清单，消息中心直接列出来。
-        # 审核员只列待他复核的；管理员还要列「已复核待复审」的（那才是「请复审」的落点）。
-        "audits": db.list_open_audits(auth.is_admin(user), limit=50)
+        # 审核员只列待他复核的；管理员**只列「待复审」**（review_only）——
+        # 结项时他已经收到「已结项，请处理」那条通知，工作台再列一遍待审核就是两条。
+        "audits": db.list_open_audits(auth.is_admin(user), limit=50, review_only=True)
                   if (user.get("can_audit") or auth.is_admin(user)) else [],
     })
 
