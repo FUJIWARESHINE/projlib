@@ -250,10 +250,11 @@ function alertDialog(title, bodyHtml, okText = "知道了") {
    数据来自 /api/notifications。通知按**角色**广播（普通账户一套 / 管理员一套），
    已读状态按**用户**存 —— 谁看过互不影响，看过之后就不再弹横幅。
      · 项目入库（普通账户收）：真实/加急/返修 → 登录弹「流光横幅」；库存只进消息中心。
-     · 项目结项（管理员 + 审核员都收）：纯告知，只进消息中心，不弹窗。
-     · 待审核（只发审核员）：弹横幅，未点「审核完成」前一直算未读。
+     · 项目全部平台完成：**不再自动发任何通知**（2026-11-06 调整）——
+       最后一个打勾的人在弹窗里点「提交审核通知」之后才继续下面的流程。
+     · 已提交审核（提交时发）：审核员收「待审核」（弹横幅，未点「审核完成」前一直算未读）；
+       管理员收一条「已提交审核」的纯告知，只进消息中心。
      · 审核完成（只发管理员）：审核员复核完才发，管理员点「复审通过」后才收掉。
-     单个平台完成不再推送，只有整单结项（所有被设计平台都 ✅）才发。
      platform_done 仅用于展示历史数据。 */
 const NOTIF_ICON = { project_in: "📦", platform_done: "✅", project_done: "🏁",
                      audit_request: "🔎", audit_done: "🛡️", broadcast: "📢" };
@@ -331,7 +332,9 @@ function notifItemHtml(n) {
              <span class="ni-hint">复核无误后点这里；<b>没点之前红点不会消</b>，以免漏审</span></div>`
         : n.audit_need_confirm
           ? `<div class="ni-act"><span class="ni-done">✅ 已复核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}，等管理员复审</span></div>`
-          : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`;
+          : n.audit_status === "draft"
+            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，等打勾人重新提交审核</span></div>`
+            : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`;
   } else if (isReview) {
     // 「某某某已审核完成，请复审」：以前这句话没有任何落点，现在挂在审核单的
     // audited 状态上 —— 管理员在这儿就能点「复审通过」，单子才算走完。
@@ -344,11 +347,13 @@ function notifItemHtml(n) {
             : `<div class="ni-act"><span class="ni-done">⏳ 已复核，等管理员复审</span></div>`)
         : n.audit_pending
           ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，需重新审核</span></div>`
-          : n.audit_status === "void"
-            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目已退回未完成，审核单已撤</span></div>`
-            : n.audit_status === "done"
-              ? `<div class="ni-act"><span class="ni-done">✅ 已复审${n.audit_confirmer ? "（" + esc(n.audit_confirmer) + "）" : ""}</span></div>`
-              : "";
+          : n.audit_status === "draft"
+            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，等打勾人重新提交审核</span></div>`
+            : n.audit_status === "void"
+              ? `<div class="ni-act"><span class="ni-done">↩︎ 项目已退回未完成，审核单已撤</span></div>`
+              : n.audit_status === "done"
+                ? `<div class="ni-act"><span class="ni-done">✅ 已复审${n.audit_confirmer ? "（" + esc(n.audit_confirmer) + "）" : ""}</span></div>`
+                : "";
   }
   // 全服通告：标出这条是发给哪些平台的（全体成员 / 细胞、分子）
   const aud = n.category === "broadcast"
@@ -494,9 +499,9 @@ function renderNotifPanel() {
           : '<div class="notif-empty">暂时没有消息</div>'}
       </div>
       <div class="notif-foot">${isAdmin()
-        ? "项目所有平台都完成（结项）时，这里会收到「项目结项」提醒，审核员复核完成后还会收到「审核完成」提醒；单个平台完成不再单独推送。点「复审通过」才算把这轮审核走完（没点之前项目一直挂在「待审核」统计里）。要发全服提醒，去左侧「全服通告」。"
+        ? "项目所有平台都完成后，最后一个打勾的人会确认「是否提交审核通知」；提交后这里会收到一条告知，审核员复核完成后还会收到「审核完成」提醒。点「复审通过」才算把这轮审核走完（没点之前项目一直挂在「待审核」统计里）。要发全服提醒，去左侧「全服通告」。"
         : state.notif.canAudit
-          ? "管理员新增项目后这里会收到「项目已入库」；项目结项后这里会出现「待审核」，复核完点「审核完成」；📢全服通告也会送到这里。待审核项目在点「审核完成」之前，这条消息和右上角红点会一直保留（点过、全部已读、清空都消不掉）。"
+          ? "管理员新增项目后这里会收到「项目已入库」；打勾人确认「提交审核通知」后这里会出现「待审核」，复核完点「审核完成」；📢全服通告也会送到这里。待审核项目在点「审核完成」之前，这条消息和右上角红点会一直保留（点过、全部已读、清空都消不掉）。"
           : "管理员新增项目后，这里会收到「项目已入库」提醒；管理员发布的📢全服通告（发给你所在平台的）也会送到这里。"}</div>
     </div>`;
   bindNotifPanel();

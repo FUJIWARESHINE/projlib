@@ -974,6 +974,25 @@ select.st-inline.st-inline-empty { color: var(--text3); opacity: .7; }
 .pill.admin { background: rgba(108, 92, 255, .16); color: var(--accent); }
 .pill.warn  { background: var(--amber-bg); color: var(--amber); }
 
+/* 「项目已完成、还没提交审核」的小标签：项目名右侧 / 待审核弹窗里都用它。
+   有提交权限时渲染成 <button>，点一下就补提交（通知审核员复核）。 */
+.pill.pill-tosubmit {
+  margin-left: 5px;
+  line-height: 16px;
+  vertical-align: middle;
+  font-family: inherit;
+  background: var(--amber-bg);
+  color: var(--amber);
+  border-color: rgba(222, 140, 20, .28);
+}
+button.pill-tosubmit { cursor: pointer; transition: background .16s ease, border-color .16s ease; }
+button.pill-tosubmit:hover:not(:disabled) { background: rgba(222, 140, 20, .26); border-color: rgba(222, 140, 20, .52); }
+button.pill-tosubmit:disabled { opacity: .6; cursor: default; }
+/* 项目名 + 标签同一行：名字过长省略，标签始终完整可见（编号列太窄，塞不下） */
+.name-wrap { display: flex; align-items: center; gap: 6px; min-width: 0; }
+table.tbl-fixed td .name-wrap .name-cell { width: auto; flex: 1 1 auto; min-width: 0; }
+.name-wrap .pill-tosubmit { flex: 0 0 auto; margin-left: 0; }
+
 /* ================= 仪表盘 ================= */
 .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 16px; }
 .kpi {

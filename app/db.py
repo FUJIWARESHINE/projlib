@@ -234,23 +234,29 @@ CREATE TABLE IF NOT EXISTS notification_reads(
   PRIMARY KEY(notification_id, user_id)
 );
 
--- 结项审核：项目所有被设计平台都完成后生成一条，走**两段式**：
+-- 结项审核：项目所有被设计平台都完成后生成一条，走**三段式**：
+--   draft    → 项目刚完成，**还没人提交审核**（不打任何人的待办、不发通知）
+--              由最后一个打勾的人在弹窗里点「提交审核通知」→ pending
 --   pending  → 审核员复核（点「审核完成」）→ audited（已复核，等管理员复审）
 --   audited  → 管理员复审（点「复审通过」）→ done
 --   撤回（项目退出已完成 / 复核不通过退回返工）→ void
 --   ★ 2026-10-28：新增 audited。此前审核完直接 done，管理员那条「请复审」提醒
 --     没有任何落地状态 —— 待审核统计立刻归 0，复审这件事整个消失在系统里。
---   ★ 同一项目再次结项（先取消再勾回来 / 内容变更）会把这条重置成 pending。
+--   ★ 2026-11-06：新增 draft。此前最后一个平台勾成 ✅ 就自动建 pending 单并给
+--     审核员推通知；现在改成由打勾人自己确认「是否提交审核通知」——
+--     没点提交之前，审核员什么都不会收到，项目只是静静地挂在「待提交审核」。
+--   ★ 同一项目再次结项（先取消再勾回来 / 内容变更）会把这条重置成 draft。
 CREATE TABLE IF NOT EXISTS project_audits(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ptype TEXT NOT NULL,
   code TEXT NOT NULL,
   project_id INTEGER DEFAULT 0,
   name TEXT DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending 待审核 / audited 待复审 / done 已复审 / void 已撤回
+  status TEXT NOT NULL DEFAULT 'pending',   -- draft 待提交 / pending 待审核 / audited 待复审 / done 已复审 / void 已撤回
   auditor_id INTEGER DEFAULT 0,             -- 复核人（审核员）
   auditor_name TEXT DEFAULT '',
-  created_at TEXT,
+  created_at TEXT,                          -- 结项时间（项目最后一次变「已完成」的时间）
+  submitted_at TEXT,                        -- 提交审核时间；空 = 还没人提交（draft）
   reviewed_at TEXT,                         -- 复核时间
   confirmer_id INTEGER DEFAULT 0,           -- 复审人（管理员）
   confirmer_name TEXT DEFAULT '',
@@ -327,6 +333,10 @@ def _migrate(conn) -> None:
        因此这条 UPDATE 天然幂等，不会把新的 done 又翻回去。
     ⑥ 回填 projects.created_at（2026-11-02 新增「按加入日期」排序）：
        早期批量导入只写了 updated_at，这里用它兜底，只填空值、幂等。
+    ⑦ 补 project_audits.submitted_at（2026-11-06 新增「提交审核」这一步）：
+       空值 = 还没人提交。存量单子里 pending / audited / done 都是老流程自动生单的，
+       相当于早就提交过了，回填成 created_at，免得界面上显示成「未提交」。
+       draft 本来就还没提交，保持空值。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     if "seq" not in cols:
@@ -357,6 +367,13 @@ def _migrate(conn) -> None:
             conn.execute("ALTER TABLE project_audits ADD COLUMN confirmed_at TEXT")
         conn.execute("UPDATE project_audits SET status='audited' "
                      "WHERE status='done' AND COALESCE(confirmed_at,'')=''")
+        # ⑦ 提交审核时间（2026-11-06）：老单子都是自动生单 = 已经提交过，回填结项时间
+        if "submitted_at" not in acols:
+            conn.execute("ALTER TABLE project_audits ADD COLUMN submitted_at TEXT")
+            conn.execute(
+                "UPDATE project_audits SET submitted_at=COALESCE(NULLIF(created_at,''),'') "
+                "WHERE status IN ('pending','audited','done') "
+                "  AND COALESCE(submitted_at,'')=''")
     # ⑥ 回填 projects.created_at（2026-11-02 新增「按加入日期」排序）：
     #    早期版本的批量导入只写了 updated_at，命中 created_at 为空的行。
     #    用 updated_at 兜底，实在没有就填当前时间；只填空值，天然幂等，
@@ -1370,16 +1387,16 @@ def worklog_months(user_id: int) -> list:
 
 
 # ================================================================== 消息中心 / 站内通知
-# 规则（2026-10-14 与用户确认）：
+# 规则（2026-10-14 与用户确认，2026-11-06 调整）：
 #   · 管理员新增「真实 / 加急 / 返修」项目 → 通知所有普通账户，登录时弹流光横幅；
 #     「库存」项目只进消息中心（未读），不弹横幅。
-#   · 单个平台勾成 ✅ → **不发通知**（2026-11-02 调整：避免逐平台刷屏）；
-#     只有该项目所有被设计平台都完成（= 结项）才发，且三类收件人分工明确
-#     （2026-11-03 调整）：
-#       project_done 项目结项 → 管理员 + 审核员都收，纯告知、不弹横幅；
-#       audit_request 审核通知 → 只发审核员，弹横幅、未审核完成前一直算未读；
-#       audit_done 复审通知    → 只发管理员，审核员点「审核完成」时发出。
-#     即：管理员不再收「已结项，请审核」，他的待办只有「复审」。
+#   · 单个平台勾成 ✅ → **不发通知**（2026-11-02 调整：避免逐平台刷屏）。
+#   · 所有被设计平台都完成（= 结项）→ **也不发通知**（2026-11-06 调整）：
+#     最后一个打勾的人会看到「项目已完成，是否提交审核通知」的弹窗，
+#     只有他点了确定（把审核单从 draft 提交成 pending）才发通知：
+#       project_done 项目已提交审核 → 只发管理员，纯告知、不弹横幅（他的待办只有「复审」）；
+#       audit_request 审核通知       → 只发审核员，弹横幅、未审核完成前一直算未读；
+#       audit_done 复审通知          → 只发管理员，审核员点「审核完成」时发出。
 # 已读状态按用户存（notification_reads），所以「谁看过」互不影响。
 NOTIF_PROJECT_IN = "project_in"        # 项目入库
 NOTIF_PLATFORM_DONE = "platform_done"  # 平台完成（历史分类：已不再产生，仅保留旧数据展示）
@@ -1940,21 +1957,25 @@ def delete_broadcast(bid: int) -> bool:
 
 
 # ================================================================== 结项审核
-# 状态机（两段式）：
+# 状态机（三段式，2026-11-06 起）：
+#   draft --打勾人点「提交审核通知」--> pending
 #   pending --审核员「审核完成」--> audited --管理员「复审通过」--> done
-#   pending / audited --项目退出已完成 / 退回返工--> void
-#   内容变更（平台完成情况变过）→ upsert_audit 重置回 pending，重新走一遍。
+#   draft / pending / audited --项目退出已完成 / 退回返工--> void
+#   内容变更（平台完成情况变过）→ 重置回 draft，由打勾人重新确认提交。
+AUDIT_DRAFT = "draft"
 AUDIT_PENDING = "pending"
 AUDIT_AUDITED = "audited"
 AUDIT_DONE = "done"
 AUDIT_VOID = "void"
 AUDIT_STATUS_NAME = {
+    AUDIT_DRAFT: "待提交审核",
     AUDIT_PENDING: "待审核",
     AUDIT_AUDITED: "已复核待复审",
     AUDIT_DONE: "已复审通过",
     AUDIT_VOID: "已撤回（项目退回未完成）",
 }
-# 「还没处理完」的状态：审核员看待办只认 pending，管理员再加上待复审
+# 「还没处理完」的状态：审核员看待办只认 pending，管理员再加上待复审。
+# draft 不算「待审核」—— 还没提交，谁都不该在待办里看到它。
 AUDIT_OPEN = (AUDIT_PENDING, AUDIT_AUDITED)
 
 
@@ -1972,40 +1993,68 @@ def _audit_public(row: dict) -> dict:
         # 还在流程里（待审核 或 待复审）→ 前端要给出对应的按钮
         "open": st in AUDIT_OPEN,
         "need_confirm": st == AUDIT_AUDITED,
+        # 项目已完成、但打勾人还没确认「提交审核通知」
+        "need_submit": st == AUDIT_DRAFT,
         "auditor_id": int(row.get("auditor_id") or 0),
         "auditor_name": row.get("auditor_name") or "",
         "confirmer_id": int(row.get("confirmer_id") or 0),
         "confirmer_name": row.get("confirmer_name") or "",
         "created_at": row.get("created_at") or "",
+        "submitted_at": row.get("submitted_at") or "",
         "reviewed_at": row.get("reviewed_at") or "",
         "confirmed_at": row.get("confirmed_at") or "",
     }
 
 
-def upsert_audit(ptype: str, code: str, project_id: int = 0, name: str = "") -> dict:
-    """项目结项 → 生成/重置一条待审核记录（同一项目只保留一条）。
+def upsert_audit(ptype: str, code: str, project_id: int = 0, name: str = "",
+                 status: str = AUDIT_DRAFT) -> dict:
+    """项目结项 → 生成/重置一条审核单（同一项目只保留一条）。
 
+    2026-11-06 起默认落 **draft（待提交审核）**：项目刚完成时不通知任何人，
+    由最后打勾的人在弹窗里点「提交审核通知」才转成 pending（见 submit_audit）。
     先取消勾选再重新勾上（重新结项）、或已复核/已复审后内容又变了（复核争议），
-    都会重置成 pending，审核人 / 复审人信息一并清空，重新走一遍两段式。
+    都会重置回 draft，审核人 / 复审人信息一并清空，重新走一遍。
     """
     ptype = (ptype or "").strip()
     code = str(code or "").strip().upper()
     if not ptype or not code:
         raise ValueError("项目类型与编号不能为空")
+    status = status if status in (AUDIT_DRAFT, AUDIT_PENDING) else AUDIT_DRAFT
+    now = _now()
     with tx() as conn:
         conn.execute(
             "INSERT INTO project_audits(ptype,code,project_id,name,status,"
-            "auditor_id,auditor_name,created_at,reviewed_at,"
+            "auditor_id,auditor_name,created_at,submitted_at,reviewed_at,"
             "confirmer_id,confirmer_name,confirmed_at) "
-            "VALUES(?,?,?,?,'pending',0,'',?,'',0,'','') "
+            "VALUES(?,?,?,?,?,0,'',?,?,'',0,'','') "
             "ON CONFLICT(ptype,code) DO UPDATE SET "
-            "  project_id=excluded.project_id, name=excluded.name, status='pending', "
-            "  auditor_id=0, auditor_name='', created_at=excluded.created_at, reviewed_at='', "
+            "  project_id=excluded.project_id, name=excluded.name, status=excluded.status, "
+            "  auditor_id=0, auditor_name='', created_at=excluded.created_at, "
+            "  submitted_at=excluded.submitted_at, reviewed_at='', "
             "  confirmer_id=0, confirmer_name='', confirmed_at=''",
-            (ptype, code, int(project_id or 0), (name or "").strip(), _now()))
+            (ptype, code, int(project_id or 0), (name or "").strip(), status,
+             now, now if status == AUDIT_PENDING else ""))
         row = conn.execute(
             "SELECT * FROM project_audits WHERE ptype=? AND code=?", (ptype, code)).fetchone()
     return _audit_public(dict(row))
+
+
+def submit_audit(aid: int):
+    """打勾人确认「提交审核通知」：draft → pending（审核员这时才收到提醒）。
+
+    只有 draft 能提交；已经 pending / audited / done / void 的返回 None，
+    由接口层给出提示（重复提交不会重复发通知）。
+    """
+    aid = int(aid or 0)
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM project_audits WHERE id=?", (aid,)).fetchone()
+        if not row or (row["status"] or "") != AUDIT_DRAFT:
+            return None
+        conn.execute(
+            "UPDATE project_audits SET status=?, submitted_at=? WHERE id=?",
+            (AUDIT_PENDING, _now(), aid))
+        new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (aid,)).fetchone())
+    return _audit_public(new)
 
 
 def get_audit(aid: int):
@@ -2063,9 +2112,12 @@ def list_open_audits(is_admin: bool = False, limit: int = 200,
       管理员算 pending + audited —— 前者是替审核员兜底（还没配审核员时也能自己审），
       后者才是他真正的待办「复审」。早期只数 pending，于是审核员一点「审核完成」，
       管理员那边的待审核统计立刻掉到 0，可「请复审」的提醒还挂在消息中心里。
+    ★ draft（项目已完成、还没提交审核）**不进任何人的待办**：2026-11-06 起它只是
+      一个「谁都能补提交」的中间态，由打勾人自己弹窗确认；只有管理员能在
+      「待审核项目」弹窗里看到那一小段清单（见 api_audits?status=draft）。
     ★ review_only=True：管理员的消息中心工作台只要「待复审」（audited）。
-      结项那一刻他已经收到「XX项目已结项，请处理」这条通知，再给他一张
-      「已结项，待审核」卡片就是同一件事在两处出现，看着乱（2026-11-03 用户反馈）。
+      提交审核那一刻他已经收到「XX项目已提交审核」这条通知，再给他一张
+      「待审核」卡片就是同一件事在两处出现，看着乱（2026-11-03 用户反馈）。
       「待审核项目」弹窗 / 审核页仍走默认口径（pending + audited），不丢兜底。
     """
     if is_admin and review_only:
@@ -2076,15 +2128,15 @@ def list_open_audits(is_admin: bool = False, limit: int = 200,
 def void_audit(ptype: str, code: str) -> int:
     """撤回审核单：项目退出「已完成」状态（取消勾选 / 复核不通过退回返工）时用。
 
-    待审核与待复审都要撤 —— 项目都没做完，管理员点「复审通过」更说不通。
+    待提交、待审核、待复审都要撤 —— 项目都没做完，管理员点「复审通过」更说不通。
     已复审（done）的历史记录保留。
     """
     with tx() as conn:
         cur = conn.execute(
             "UPDATE project_audits SET status=?, reviewed_at=? "
-            "WHERE ptype=? AND UPPER(code)=UPPER(?) AND status IN (?,?)",
+            "WHERE ptype=? AND UPPER(code)=UPPER(?) AND status IN (?,?,?)",
             (AUDIT_VOID, _now(), (ptype or "").strip(), str(code or "").strip(),
-             AUDIT_PENDING, AUDIT_AUDITED))
+             AUDIT_DRAFT, AUDIT_PENDING, AUDIT_AUDITED))
         return int(cur.rowcount or 0)
 
 

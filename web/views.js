@@ -364,7 +364,7 @@ VIEWS.browse = async (root) => {
         </select>
         <span class="spacer"></span>
         ${canAudit ? `<button class="btn btn-sm audit-entry${auditItems.length ? "" : " zero"}" id="btnAudits"
-          title="项目所有被设计平台都完成后产生审核单；审核员复核完还要管理员「复审通过」才算走完流程，没走完的项目都算在这里">
+          title="项目所有被设计平台都完成后，打勾人确认「提交审核通知」才进审核；审核员复核完还要管理员「复审通过」才算走完流程，没走完的项目都算在这里">
           <span class="aud-dot"></span>待审核<b id="auditCnt">${auditItems.length}</b></button>` : ""}
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
         ${admin ? `
@@ -434,7 +434,8 @@ VIEWS.browse = async (root) => {
                 (r.seq || 0) > 0
                   ? `<span class="pill pill-times" title="同一编号的第 ${r.seq + 1} 次记录（如同一个项目多次返修）">×${r.seq + 1}</span>`
                   : ""}</td>
-              <td><span class="name-cell" title="${esc(r.name)}">${esc(r.name)}</span></td>
+              <td><div class="name-wrap"><span class="name-cell" title="${esc(r.name)}">${esc(r.name)}</span>${
+                submitTag(r, !!d.can_submit_audit)}</div></td>
               ${PLAT_COLS.map((p) => `<td class="plat">${stCell(r.id, p, r[p])}</td>`).join("")}
               <td><span class="price-cell" title="${esc(r.extra)}">${price}</span></td>
               <td><span class="note-cell${noteHot ? " note-repair" : ""}" title="${esc(note)}">${esc(note) || "—"}</span></td>
@@ -461,6 +462,13 @@ VIEWS.browse = async (root) => {
 
     $$("[data-edit]").forEach((b) => b.addEventListener("click", () => editProject(Number(b.dataset.edit), load)));
     bindInline();
+    // 「待提交审核」标签：点一下就补提交（通知审核员复核）
+    $$("[data-submit-audit]").forEach((b) => b.addEventListener("click", async () => {
+      if (!confirm("提交审核通知？提交后审核员会收到「项目已结项，请审核」的提醒。")) return;
+      b.disabled = true;
+      const done = await submitAuditNow(Number(b.dataset.submitAudit));
+      if (done) load(); else b.disabled = false;
+    }));
     $$("[data-pg]").forEach((b) => b.addEventListener("click", () => {
       B.page += b.dataset.pg === "next" ? 1 : -1;
       if (B.page < 1) B.page = 1;
@@ -477,12 +485,16 @@ VIEWS.browse = async (root) => {
         const prev = (B.data.rows || []).find((x) => String(x.id) === String(id))?.[plat] ?? "";
         sel.disabled = true;
         try {
-          await api(`/api/projects/${id}/status`, { method: "PUT", body: { platform: plat, value: v } });
+          const res = await api(`/api/projects/${id}/status`, { method: "PUT", body: { platform: plat, value: v } });
           const row = (B.data.rows || []).find((x) => String(x.id) === String(id));
           if (row) row[plat] = v;                       // 同步本地数据，避免整页重载
           sel.classList.remove("st-inline-empty", "st-inline-done", "st-inline-undone", "st-inline-none");
           sel.classList.add(stClass(v));
           toast("已更新");
+          // 最后一个平台勾成 ✅ → 问「要不要提交审核通知」（不再自动审核）
+          if (res.ask_submit) askSubmitAudit(res.ask_submit, load);
+          // 原本挂着「待提交审核」，这一改项目又不算完成了 → 刷新把标记清掉
+          else if (row && row.audit_status === "draft") load();
         } catch (e) {
           sel.value = prev;                             // 失败回滚
           toast(e.message, "error");
@@ -541,10 +553,89 @@ VIEWS.browse = async (root) => {
   await load();
 };
 
+/* ------------------------------------------------ 「要不要提交审核」的确认弹窗 */
+/* 2026-11-06 起**不再自动审核**：最后一个平台被勾成 ✅ 时，后端只落一张
+   「待提交审核(draft)」的单子、不给任何人发通知，由打勾的人在这里决定：
+     · 提交审核通知 → POST /api/audits/<id>/submit，审核员这时才收到「请审核」；
+     · 稍后再说     → 什么都不发，项目标成「待提交审核」，之后还能在列表里补提交。 */
+async function submitAuditNow(auditId) {
+  try {
+    await api("/api/audits/" + auditId + "/submit", { method: "POST", body: {} });
+    toast("已提交审核，已通知审核员复核");
+    loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标
+    refreshAuditBadge();                                   // 同步顶部「待审核 N」
+    return true;
+  } catch (e) {
+    toast(e.message, "error");
+    return false;
+  }
+}
+
+/* 顶部「待审核 N」的即时刷新：提交审核 / 审核完成之后不必退出视图再进来。
+   没有这个入口（普通实验员）或没权限时静默跳过。 */
+async function refreshAuditBadge() {
+  const btn = $("#btnAudits"), cnt = $("#auditCnt");
+  if (!btn || !cnt) return;
+  try {
+    const items = ((await api("/api/audits?status=pending")).data || {}).items || [];
+    cnt.textContent = items.length;
+    btn.classList.toggle("zero", !items.length);
+  } catch (e) { /* 没权限就保持原样 */ }
+}
+
+function askSubmitAudit(info, after) {
+  if (!info || !info.audit_id) return;
+  const meta = [info.type_label, info.name, info.done_labels ? "完成平台：" + info.done_labels : ""]
+    .filter(Boolean).map(esc).join("｜");
+  openModal({
+    title: "项目已完成",
+    body: `
+      <div class="notice info" style="margin:0 0 14px">
+        <span>🏁</span>
+        <div><b>${esc(info.code)}</b> 项目所有被设计平台的实验都已完成。${
+          info.reopened ? "这轮内容有变更，审核流程需要重新走一遍。" : ""}</div>
+      </div>
+      <div class="hint" style="line-height:2">
+        <div>· <b>提交审核通知</b>：审核员会立刻收到「${esc(info.code)}项目已结项，请审核」的提醒，
+          复核完成后再由管理员复审通过。</div>
+        <div>· <b>稍后再说</b>：现在不通知任何人，项目会标成<b>「待提交审核」</b>，
+          之后可以在项目库列表里补提交。</div>
+      </div>
+      <div class="hint" style="margin-top:12px">${meta}</div>`,
+    footer: `<span style="flex:1"></span>
+      <button class="btn btn-ghost" data-close>稍后再说</button>
+      <button class="btn btn-primary" data-submit>提交审核通知</button>`,
+    // 关掉弹窗（提交完 / 稍后再说 / 点遮罩）都刷新一次列表：
+    // 提交完要看「待审核」状态，稍后再说要让「待提交审核」标签立刻出现。
+    onClose() { if (typeof after === "function") after(); },
+    onMount(root) {
+      $("[data-submit]", root).addEventListener("click", async (ev) => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        const done = await submitAuditNow(info.audit_id);
+        btn.disabled = false;
+        if (!done) return;
+        closeModal();          // 关窗即触发 onClose → 刷新列表
+      });
+    },
+  });
+}
+
+/* 列表 / 待审核弹窗里的「待提交审核」小标签 */
+function submitTag(r, canSubmit) {
+  if (!r || r.audit_status !== "draft") return "";
+  if (!canSubmit) {
+    return `<span class="pill pill-tosubmit" title="项目已完成，等打勾人点「提交审核通知」">待提交审核</span>`;
+  }
+  return `<button class="pill pill-tosubmit" data-submit-audit="${r.audit_id}"
+    title="项目已全部完成但还没提交审核 · 点这里通知审核员复核">待提交审核</button>`;
+}
+
 /* ------------------------------------------------ 待审核项目（项目库模块入口） */
-/* 项目所有被设计平台都勾成 ✅ 时，后端会自动落一条 project_audits(pending)。
+/* 项目所有被设计平台都勾成 ✅ 时，后端只落一条 project_audits(draft)，
+   由打勾人点「提交审核通知」才转成 pending（审核员这时才收到提醒）。
    入口只给「管理员」和「开了审核权限的账号」显示（GET /api/audits 同口径，403 就藏起来）。
-   两段式：pending 点「审核完成」→ audited，再由管理员点「复审通过」→ done。
+   三段式：draft 提交 → pending 点「审核完成」→ audited，再由管理员点「复审通过」→ done。
    ★ 这个数字必须把 audited 也算进来，否则审核员一点「审核完成」就变 0，
      而管理员那条「请复审」的提醒还挂在消息中心，看起来就像「没进统计」。 */
 function auditRowHtml(a) {
@@ -565,10 +656,33 @@ function auditRowHtml(a) {
   </div>`;
 }
 
+/* 「已完成、但打勾人还没提交审核」的行：只有管理员会看到这一段（他负责催）
+   —— 点「提交审核」= 代打勾人补提交，审核员这时才收到提醒。 */
+function draftRowHtml(a) {
+  return `<div class="aud-row" data-aid="${a.id}">
+    <div class="aud-main">
+      <div class="aud-title">${typePill(a.ptype)}<b class="aud-code aud-jump" data-aud-jump="${esc(a.code)}"
+        title="在项目库里查看这个项目">${esc(a.code)}</b>
+        <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span>
+        <span class="ni-tag">待提交审核</span></div>
+      <div class="aud-sub">结项时间 ${esc(notifTime(a.created_at)) || "—"} · 还没提交审核通知，审核员不会收到提醒</div>
+    </div>
+    <button class="btn btn-primary btn-sm" data-submit-aud="${a.id}">提交审核</button>
+  </div>`;
+}
+
 async function pendingAuditsDialog() {
   let items = [];
+  let drafts = [];
+  const admin = isAdmin();
   const fetchAudits = async () => {
-    items = (await api("/api/audits?status=pending")).data.items || [];
+    const d = (await api("/api/audits?status=pending")).data || {};
+    items = d.items || [];
+    // 「已完成未提交」不属于谁的待办，只让管理员看一眼（免得有人忘了提交、项目永远不审）
+    if (admin) {
+      try { drafts = ((await api("/api/audits?status=draft")).data || {}).items || []; }
+      catch (e) { drafts = []; }
+    }
     return items;
   };
   try { await fetchAudits(); } catch (e) { return toast(e.message, "error"); }
@@ -592,7 +706,11 @@ async function pendingAuditsDialog() {
             ? `（其中 <b>${needCnt}</b> 个已复核、等你复审）` : ""}${items.length
             ? "。审核员复核无误后点「审核完成」，管理员收到复审提醒；管理员复核无误后点「复审通过」，这一轮才算走完。" : "。"}</div>
           <div class="aud-list">${items.length ? items.map(auditRowHtml).join("")
-            : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>`;
+            : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>
+          ${drafts.length ? `
+            <div class="aud-head" style="margin-top:16px">已完成、但<b>还没提交审核</b>的项目（<b>${drafts.length}</b> 个）：
+              打勾人没点「提交审核通知」就不会打扰审核员，这里可以代为补提交。</div>
+            <div class="aud-list">${drafts.map(draftRowHtml).join("")}</div>` : ""}`;
         syncEntry();
         // 点编号 → 关弹窗并在项目库里搜这个编号（审核前先核对项目内容）
         $$("[data-aud-jump]", wrap).forEach((el) => el.addEventListener("click", () => {
@@ -626,6 +744,16 @@ async function pendingAuditsDialog() {
           try { await fetchAudits(); } catch (e) { /* 拉不到就保留旧列表 */ }
           paint();
           loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标
+        }));
+        $$("[data-submit-aud]", wrap).forEach((b) => b.addEventListener("click", async (ev) => {
+          ev.stopPropagation();
+          const btn = ev.currentTarget;
+          if (!confirm("提交审核通知？提交后审核员会收到「项目已结项，请审核」的提醒。")) return;
+          btn.disabled = true;
+          const done = await submitAuditNow(Number(btn.dataset.submitAud));
+          if (!done) { btn.disabled = false; return; }
+          try { await fetchAudits(); } catch (e) { /* 拉不到就保留旧列表 */ }
+          paint();
         }));
       };
       paint();
@@ -719,6 +847,7 @@ function editProject(id, reload) {
           };
           if (!payload.code) return toast("项目编号不能为空", "warn");
           try {
+            let res;
             if (isNew) {
               // 同类型下已有同编号时先确认：同一编号允许多条（多次返修），
               // 但直接再新增多半是「想改归属」而不是真想再记一条。
@@ -732,11 +861,13 @@ function editProject(id, reload) {
                   + `· 若确实要再记一条（如再次返修）：确定，会追加为新的第 ${same.length + 1} 条。`);
                 if (!ok2) return;
               }
-              await api("/api/projects", { method: "POST", body: payload });
+              res = await api("/api/projects", { method: "POST", body: payload });
             } else {
-              await api("/api/projects/" + id, { method: "PUT", body: payload });
+              res = await api("/api/projects/" + id, { method: "PUT", body: payload });
             }
             closeModal(); toast("已保存"); reload();
+            // 弹窗里把所有平台都勾成 ✅ → 同样问一句「要不要提交审核通知」
+            if (res && res.ask_submit) askSubmitAudit(res.ask_submit, reload);
           } catch (e) { toast(e.message, "error"); }
         });
         const delBtn = $("[data-del]", root);
@@ -1977,8 +2108,8 @@ VIEWS.users = async (root) => {
       <span>👥</span>
       <div><b>管理员</b>可管理项目库、导入数据、导出文件，并管理账号；
         <b>普通用户</b>只能填写自己所属平台的板块（运营/设计为只读）。
-        「<b>开启审核</b>」给某个普通账号加上<b>审核功能</b>：项目结项后他会收到弹窗提醒，
-        复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。
+        「<b>开启审核</b>」给某个普通账号加上<b>审核功能</b>：项目全部完成、打勾人确认「提交审核通知」后，
+        他会收到弹窗提醒；复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。
         ⚠️ 通知里显示的是账号的<b>「姓名」</b>，不是登录用户名；没填姓名的账号会被写成「账号 xxx」，
         建议都补上。自助注册只能创建普通用户，管理员账号请在此处新增。</div>
     </div>
@@ -2037,7 +2168,7 @@ VIEWS.users = async (root) => {
     const on = b.dataset.on === "1";
     const u = users.find((x) => String(x.id) === String(uid)) || {};
     if (!on && !confirm(`给「${personLabel(u)}」开启审核功能？\n\n`
-      + `开启后，项目结项时该账号会收到「请审核」弹窗提醒，\n`
+      + `开启后，项目全部完成且打勾人提交审核通知时，该账号会收到「请审核」弹窗提醒，\n`
       + `复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。`)) return;
     try {
       await api("/api/users/" + uid, { method: "PUT", body: { can_audit: !on } });
@@ -2086,7 +2217,7 @@ function rolePlatformFields(role, platform, canAudit) {
       <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer">
         <input type="checkbox" id="u_audit"${canAudit ? " checked" : ""} style="width:auto;margin-top:3px">
         <span style="font-size:12.5px;color:var(--text2);line-height:1.55">
-          <b>开启审核功能</b>：项目结项后该账号会收到「请审核」弹窗提醒，
+          <b>开启审核功能</b>：项目全部完成、打勾人点「提交审核通知」后，该账号会收到「请审核」弹窗提醒；
           复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。<br>
           <span style="color:var(--text3)">（只对普通用户有效，管理员不需要）</span>
         </span>

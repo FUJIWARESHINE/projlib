@@ -235,98 +235,129 @@ def _audit_content_changed(before: dict, after: dict) -> bool:
     return False
 
 
-def _notify_status_change(before: dict, after: dict, user: dict) -> None:
-    """项目平台状态写入后的通知分发（项目库列表内联点勾 / 编辑弹窗共用）。
+def _notify_status_change(before: dict, after: dict, user: dict):
+    """项目平台状态写入后的收尾（项目库列表内联点勾 / 编辑弹窗共用）。
 
-    ① 单个平台完成（非 ✅ → ✅）：**不再发通知**。
+    返回值：项目**刚刚变成「已完成」**、需要问打勾人「要不要提交审核」时，
+    返回一份 ask_submit 信息（见下方 ③），否则 None。
+
+    ① 单个平台完成（非 ✅ → ✅）：**不发任何通知**。
        以前每勾一个平台就给管理员推一条「XX 平台已完成」，四个平台就是四条，
-       消息中心被刷屏；现在只在整单结项（所有被设计平台都 ✅）时推一条。
+       消息中心被刷屏。
     ② 结项 / 复核：写入后项目处于「已完成」状态，且**平台完成情况确实变了**，才建单。
-       · 首次结项（未完成 → 完成）→ 建单 + 通知；
+       · 首次结项（未完成 → 完成）→ 建一条 **draft（待提交审核）** 单；
        · 已复核（audited，等管理员复审）/ 已复审（done）之后又改了平台完成情况
-         （cell/mol/path/animal 任一列）→ **重新开单**，状态重置回 pending，
-         通知文案写「请重新审核」；
-         这是「复核」的正路 —— 早期只认「未完成 → 完成」这一次状态迁移，
-         于是复核阶段在编辑弹窗里改平台（完成状态没翻转）就静默丢掉，
-         待审核统计里始终没有这个项目，只有最早那条通知。
+         （cell/mol/path/animal 任一列）→ 重置回 draft，重新确认提交；
        · 只改发送日期 / 项目名 / 报价 / 备注 / 孙徐审核标记 → **不算变更，不重开审核**；
-         原样保存或已经 pending → 同样不动，避免重复刷单。
-       **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要进审核流程。
-    ③ 收件人分工（2026-11-03 调整）：
-       · 项目结项通知（project_done）→ **管理员 + 审核员**各一条，纯告知、不弹横幅。
-         管理员那条固定是「XX项目已结项，请处理」，**不出现任何审核字眼**
-         （以前写「已结项，请审核」，他会误以为要自己去审）；
-       · 审核通知（audit_request）    → **只发审核员**，弹横幅、未审核完成前一直算未读；
-       · 复审通知（audit_done）       → **只发管理员**，在审核员点「审核完成」时才发
-         （见 api_audit_done）—— 管理员这条链路上只做复审。
-       另外，消息中心「待我处理」工作台里管理员只看「待复审」（见 api_notifications），
-       所以结项那一刻管理员只会收到**一条**消息，不会出现「待审核卡片 + 通知」两条。
-       例外：全站一个审核员都没有时，审核通知兜底发给管理员，否则这条待审核单
-       没人能处理（消息中心的工作台也不再给他列 pending）。
+         原样保存、已经是 pending 或 draft → 同样不动，避免重复刷单。
+       **与操作者角色无关**：管理员替实验员把最后一个平台勾完，一样要问一遍。
+    ③ 2026-11-06 起「不再自动审核」：建单只落 draft，**一条通知都不发**。
+       最后一个打勾的人拿到 ask_submit 后由前端弹窗问「项目已完成，是否提交审核通知」，
+       点了确定才走 api_submit_audit（draft → pending，这时审核员才收到提醒）。
+       没人提交的话，项目就停在「待提交审核」——不进任何人的待办、不发任何通知，
+       列表里带「待提交审核」标记，随时可以补提交（见 api_submit_audit）。
     """
     if after is None:
-        return
+        return None
     before = before or {}
-    uid = int((user or {}).get("id") or 0)
     pid = int(after.get("id") or 0)
     code = after.get("code") or ""
     name = after.get("name") or ""
     ptype = after.get("ptype") or ""
     type_label = db.TYPE_NAME.get(ptype, ptype)
 
-    # ① 单个平台完成不再单独播报 —— 只等整单结项时推一条（见下方 ②）
     # ② 结项 / 复核：只认「写入后已完成」+「内容确实变过」
     st_before = db.project_status(before)
     st_after = db.project_status(after)
     if not st_after["completed"]:
-        # 复核不通过 / 取消勾选 → 项目退出完成态，撤掉它的待审核单，
+        # 复核不通过 / 取消勾选 → 项目退出完成态，撤掉它的审核单（含待提交），
         # 否则审核员会看到一个还没做完的项目挂在「待审核」里
         if st_before["completed"]:
             _safe_notify(db.void_audit,
                          before.get("ptype") or ptype, before.get("code") or code)
-        return
+        return None
     if st_before["completed"] and not _audit_content_changed(before, after):
-        return
+        return None
     cur = db.get_audit_by(ptype, code)
-    if cur and cur.get("status") == "pending":
-        return                       # 已经在待审核里，别重复建单/刷通知
-    reopened = bool(cur)             # 有历史单（已审核）→ 这一轮是复核
-    has_auditor = db.has_auditor()
+    if cur and cur.get("status") in (db.AUDIT_DRAFT, db.AUDIT_PENDING):
+        # 已经在待提交 / 待审核里，别重复建单（也不会重复刷弹窗）
+        return None
+    reopened = bool(cur)             # 有历史单（已审核过）→ 这一轮是复核
 
-    done_labels = "、".join(db.PLATFORM_LABEL.get(k, k) for k in st_after["done"])
-    # 结项告知的正文只有「类型 / 项目名 / 完成平台」—— 一点审核字眼都不带，
-    # 审核相关信息（谁去审、怎么点）只出现在审核员那条里。
-    body = f"{type_label}｜{name}｜完成平台：{done_labels}"
-    settle_title = f"{code}项目{'内容有变更，已重新结项' if reopened else '已结项'}"
+    # ③ 只落一张「待提交审核」的单子：不发通知、不进待办
+    audit = _safe_notify(db.upsert_audit, ptype, code, pid, name, db.AUDIT_DRAFT)
+    if not isinstance(audit, dict) or not audit.get("id"):
+        return None
+    return {
+        "audit_id": int(audit["id"]),
+        "ptype": ptype,
+        "type_label": type_label,
+        "code": code,
+        "name": name,
+        "project_id": pid,
+        "reopened": bool(reopened),
+        "done_labels": "、".join(db.PLATFORM_LABEL.get(k, k) for k in st_after["done"]),
+    }
 
-    # ③ 项目结项通知：管理员与审核员都收，纯告知（不弹横幅）。
-    #    管理员那条只写「已结项，请处理」—— 不带「请审核 / 待审核」，他的待办只有「复审」。
+
+def _notify_audit_submitted(audit: dict, user: dict) -> None:
+    """打勾人点了「提交审核通知」→ 这时才发通知（2026-11-06 调整）。
+
+    收件人分工：
+      · 审核通知（audit_request）→ **只发审核员**，弹横幅、未审核完成前一直算未读；
+        全站还没配审核员时兜底发给管理员，否则这条单子没人能处理。
+      · 项目结项告知（project_done）→ **只发管理员**一条，纯告知、不弹横幅：
+        写「已提交审核，等待 XX 复核」，让他知道进展；他的待办仍是复核完后的「复审」。
+    """
+    uid = int((user or {}).get("id") or 0)
+    ptype = audit.get("ptype") or ""
+    code = audit.get("code") or ""
+    pid = int(audit.get("project_id") or 0)
+    type_label = audit.get("type_label") or db.TYPE_NAME.get(ptype, ptype)
+    body = f"{type_label}｜{audit.get('name') or ''}"
+    if audit.get("done_labels"):
+        body += f"｜完成平台：{audit['done_labels']}"
+
     _safe_notify(db.add_notification,
                  db.NOTIF_PROJECT_DONE, db.ROLE_ADMIN,
-                 f"{settle_title}，请处理", body,
+                 f"{code}项目已提交审核，等待复核", body,
                  ptype=ptype, code=code, project_id=pid, created_by=uid)
-    if has_auditor:
-        _safe_notify(db.add_notification,
-                     db.NOTIF_PROJECT_DONE, db.ROLE_AUDITOR, settle_title, body,
-                     ptype=ptype, code=code, project_id=pid, created_by=uid)
 
-    # ④ 审核通知：**只发审核员**（横幅 + sticky），管理员不再收这条
-    _safe_notify(db.upsert_audit, ptype, code, pid, name)
-    audit_title = f"{code}项目{'内容已变更，请重新审核' if reopened else '已结项，请审核'}"
-    audit_body = body + ("｜复核：项目内容有变更，需再次审核" if reopened else "")
-    audit_body += "｜复核无误后在消息中心点「审核完成」"
-    if has_auditor:
+    audit_title = f"{code}项目已结项，请审核"
+    audit_body = body + "｜复核无误后在消息中心点「审核完成」"
+    if db.has_auditor():
         _safe_notify(db.add_notification,
                      db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR, audit_title, audit_body,
                      ptype=ptype, code=code, project_id=pid, popup=True,
                      created_by=uid)
     else:
-        # 兜底：全站还没配审核员 → 只能由管理员自己审，这一条发给他，
-        # 免得待审核单只躺在「待我处理」清单里被漏掉。
         _safe_notify(db.add_notification,
                      db.NOTIF_AUDIT_REQUEST, db.ROLE_ADMIN, audit_title, audit_body,
                      ptype=ptype, code=code, project_id=pid, popup=True,
                      created_by=uid)
+
+
+def _can_submit_audit(user) -> bool:
+    """谁能把「待提交审核」的单子提交出去：
+
+    管理员、开了审核权限的账号（可以先自己核对再提交），
+    以及任一可填报平台（细胞/分子/病理/动物）的实验员 —— 运营 / 设计只读，不能提交。
+    """
+    user = user or {}
+    if not user:
+        return False
+    if auth.is_admin(user) or user.get("can_audit"):
+        return True
+    return any(auth.can_edit_platform(user, k) for k, _label in db.PLATFORMS)
+
+
+def _submit_audit(aid: int, user: dict):
+    """draft → pending，并发出「请审核」通知。返回审核单；状态不对返回 None。"""
+    audit = _safe_notify(db.submit_audit, int(aid or 0))
+    if not isinstance(audit, dict) or not audit.get("id"):
+        return None
+    _notify_audit_submitted(audit, user)
+    return audit
 
 
 def api_audits(query, _b, ctx=None):
@@ -337,6 +368,8 @@ def api_audits(query, _b, ctx=None):
       · 管理员 → pending + audited（等他复审）。
       这是「待审核」统计的唯一口径 —— 以前不分角色只数 pending，
       审核员一点「审核完成」，管理员那边就定格在 0，可「请复审」的提醒还挂着。
+    ?status=draft = 项目已完成、但打勾人还没点「提交审核通知」（只有管理员会看这段，
+      用来催 / 代提交）；它不属于任何人的待办，所以不计入 pending。
     ?status=done / void / audited / all 查历史（只读展示用）。
     """
     user = (ctx or {}).get("user") or {}
@@ -344,7 +377,7 @@ def api_audits(query, _b, ctx=None):
     if not (user.get("can_audit") or is_admin):
         return fail("没有审核权限", 403)
     status = (query.get("status", ["pending"])[0] or "pending").strip()
-    if status not in ("pending", "open", "audited", "done", "void", "all"):
+    if status not in ("pending", "open", "audited", "draft", "done", "void", "all"):
         return fail("status 不合法", 400)
     if status in ("pending", "open"):
         items = db.list_open_audits(is_admin)
@@ -356,8 +389,33 @@ def api_audits(query, _b, ctx=None):
                "pending": db.count_audits("pending"),
                "audited": db.count_audits("audited"),
                "open": db.count_audits("open"),
+               # 已完成、但打勾人还没点「提交审核通知」的单子（没人待办，只是让人看得见）
+               "draft": db.count_audits("draft"),
                "can_audit": bool(user.get("can_audit")),
-               "is_admin": is_admin})
+               "is_admin": is_admin,
+               "can_submit": _can_submit_audit(user)})
+
+
+def api_submit_audit(_q, _b, aid, ctx=None):
+    """把「待提交审核」的单子正式提交 —— 审核员**到这一步才**收到审核通知。
+
+    2026-11-06 起不再「勾完最后一个平台就自动审核」：
+    最后一个打勾的人在弹窗里点「提交审核通知」→ 这里把 draft 置成 pending，
+    同时给审核员发「请审核」横幅、给管理员发一条「已提交审核」的纯告知。
+    重复提交（已 pending / 已复审）返回 409，不会重复通知。
+    """
+    user = (ctx or {}).get("user") or {}
+    if not _can_submit_audit(user):
+        return fail("没有提交审核的权限", 403)
+    cur = db.get_audit(aid)
+    if not cur:
+        return fail("该审核记录不存在", 404)
+    if cur.get("status") != db.AUDIT_DRAFT:
+        return fail(f"该项目{cur.get('status_name') or '已提交'}，无需重复提交", 409, audit=cur)
+    audit = _submit_audit(aid, user)
+    if not audit:
+        return fail("提交失败，请刷新后重试", 409, audit=db.get_audit(aid))
+    return ok({"audit": audit})
 
 
 def api_audit_done(_q, _b, aid, ctx=None):
@@ -614,8 +672,13 @@ def api_types(_q, _b):
     return ok([{"key": k, "label": v} for k, v in db.TYPES])
 
 
-def api_list_projects(query, _b):
-    return ok(db.list_projects(
+def api_list_projects(query, _b, ctx=None):
+    """项目库分页查询。
+
+    ★ 每行带上会计单状态（audit_status / audit_id），前端据此给「待提交审核」的行
+      画标记与「提交审核」按钮 —— 打勾人关掉弹窗 / 换了个人来看，都能从这里补提交。
+    """
+    data = db.list_projects(
         ptype=query.get("ptype", [""])[0],
         search=query.get("search", [""])[0],
         platform=query.get("platform", [""])[0],
@@ -625,7 +688,15 @@ def api_list_projects(query, _b):
         order=query.get("order", ["asc"])[0] or "asc",
         sort=query.get("sort", ["code"])[0] or "code",
         group=query.get("group", ["type"])[0] or "type",
-    ))
+    )
+    user = (ctx or {}).get("user") or {}
+    amap = db.audit_map()
+    for r in data.get("rows") or []:
+        a = amap.get((r.get("ptype") or "", str(r.get("code") or "").upper())) or {}
+        r["audit_status"] = a.get("status") or ""
+        r["audit_id"] = int(a.get("id") or 0)
+    data["can_submit_audit"] = _can_submit_audit(user)
+    return ok(data)
 
 
 def api_get_project(_q, _b, pid):
@@ -648,13 +719,14 @@ def api_create_project(_q, body, ctx=None):
         return fail(str(exc))
     # 新增项目 → 通知全体普通账户（真实/加急/返修弹横幅，库存只进消息中心）
     row = db.get_project(pid)
+    ask = None
     if row:
         _safe_notify(_notify_project_added, row["ptype"], row["code"],
                      row.get("name") or "",
                      created_by=int(((ctx or {}).get("user") or {}).get("id") or 0))
-        # 手工新增时就把所有平台填成 ✅ 的，一样要进结项审核
-        _notify_status_change({}, row, (ctx or {}).get("user") or {})
-    return ok({"id": pid})
+        # 手工新增时就把所有平台填成 ✅ 的：落一张「待提交审核」单，由前端弹窗问要不要提交
+        ask = _notify_status_change({}, row, (ctx or {}).get("user") or {})
+    return ok({"id": pid}, ask_submit=ask)
 
 
 def api_update_project(_q, body, pid, ctx=None):
@@ -666,24 +738,30 @@ def api_update_project(_q, body, pid, ctx=None):
     if not before:
         return fail("项目不存在", 404)
     db.update_project(pid, body)
-    # 编辑弹窗里也能改平台状态（cell/mol/path/animal），
-    # 这条路径以前完全不通知 —— 管理员整套平台改成 ✅ 后审核员收不到待审核。
+    # 编辑弹窗里也能改平台状态（cell/mol/path/animal）：
+    # 全部勾成 ✅ 后同样只落「待提交审核」，由前端弹窗问要不要提交审核通知。
     after = db.get_project(pid)
-    _notify_status_change(before, after, (ctx or {}).get("user") or {})
+    ask = _notify_status_change(before, after, (ctx or {}).get("user") or {})
     # 换了类型 / 编号（库存转加急、编号写错重改）：旧组若一条项目都不剩，
-    # 它的待审核单跟着作废，免得「待审核」里挂着一条已经改走的旧编号。
+    # 它的审核单跟着作废，免得「待审核」里挂着一条已经改走的旧编号。
     if after and (str(before.get("ptype") or "") != str(after.get("ptype") or "")
                   or str(before.get("code") or "").strip().upper()
                   != str(after.get("code") or "").strip().upper()):
         if not db.find_by_codes(before.get("ptype") or "", [before.get("code") or ""]):
             _safe_notify(db.void_audit, before.get("ptype") or "", before.get("code") or "")
-    return ok(True)
+    return ok(True, ask_submit=ask)
 
 
 def api_set_platform_status(_q, body, pid, ctx=None):
     """只改某个项目的**一个平台**状态（实验员日常填报用）。
     服务端强制校验：只能改自己岗位的平台；运营/设计只读；管理员全平台。
-    只允许写 cell/mol/path/animal 四列，杜绝借此改其他字段。"""
+    只允许写 cell/mol/path/animal 四列，杜绝借此改其他字段。
+
+    ★ 把最后一个平台勾成 ✅ 时**不再自动发审核通知**：
+      只落一张「待提交审核」的单子，响应里带 ask_submit（含 audit_id / 编号 / 项目名），
+      前端据此弹窗问「项目已完成，是否提交审核通知」；点了确定才走
+      POST /api/audits/<audit_id>/submit（审核员这时才收到通知）。
+    """
     user = (ctx or {}).get("user") or {}
     plat = (body.get("platform") or "").strip()
     value = body.get("value")
@@ -698,9 +776,9 @@ def api_set_platform_status(_q, body, pid, ctx=None):
     if not before:
         return fail("项目不存在", 404)
     db.update_project(pid, {plat: value})
-    # 平台状态变更 → 通知管理员 / 结项进审核（普通账户与管理员都走同一条逻辑）
-    _notify_status_change(before, db.get_project(pid), user)
-    return ok({"platform": plat, "value": value})
+    # 平台状态变更 → 结项时落「待提交审核」单（普通账户与管理员都走同一条逻辑）
+    ask = _notify_status_change(before, db.get_project(pid), user)
+    return ok({"platform": plat, "value": value}, ask_submit=ask)
 
 
 def api_delete_project(_q, _b, pid):
@@ -1545,8 +1623,9 @@ ROUTES = [
     ("GET", re.compile(r"^/api/notifications$"), api_notifications),
     ("POST", re.compile(r"^/api/notifications/read$"), api_notifications_read),
     ("POST", re.compile(r"^/api/notifications/clear$"), api_notifications_clear),
-    # ---- 结项审核（两段式：审核员复核 → 管理员复审）
+    # ---- 结项审核（三段式：提交审核 → 审核员复核 → 管理员复审）
     ("GET", re.compile(r"^/api/audits$"), api_audits),
+    ("POST", re.compile(r"^/api/audits/(\d+)/submit$"), api_submit_audit),
     ("POST", re.compile(r"^/api/audits/(\d+)/done$"), api_audit_done),
     ("POST", re.compile(r"^/api/audits/(\d+)/confirm$"), api_audit_confirm),
     # ---- 全服通告（仅管理员：发布 / 查看已发布 / 撤回）
@@ -1582,7 +1661,8 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_set_platform_status,
              api_create_project, api_update_project, api_import_run, api_import_path,
              api_notifications, api_notifications_read, api_notifications_clear,
-             api_audits, api_audit_done, api_audit_confirm,
+             api_list_projects,
+             api_audits, api_submit_audit, api_audit_done, api_audit_confirm,
              api_broadcasts, api_broadcast_create, api_broadcast_reads,
              api_broadcast_delete,
              api_worklogs_list, api_worklog_create, api_worklog_update,
