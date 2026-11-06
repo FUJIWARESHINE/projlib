@@ -363,8 +363,8 @@ VIEWS.browse = async (root) => {
         </select>
         <span class="spacer"></span>
         ${canAudit ? `<button class="btn btn-sm audit-entry${auditItems.length ? "" : " zero"}" id="btnAudits"
-          title="待我审核 / 复审的项目">
-          <span class="aud-dot"></span>待审核<b id="auditCnt">${auditItems.length}</b></button>` : ""}
+          title="${admin ? "等我复审的项目" : "等我审核的项目"}">
+          <span class="aud-dot"></span>${admin ? "待复审" : "待审核"}<b id="auditCnt">${auditItems.length}</b></button>` : ""}
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
         ${admin ? `
           <button class="btn btn-ghost btn-sm" id="btnExportAll">导出整库</button>
@@ -696,10 +696,12 @@ function draftRowHtml(a) {
 async function pendingAuditsDialog() {
   let items = [];
   let drafts = [];
+  let noAuditor = false;      // 全站还没有审核员时，待审核会兜底给管理员
   const admin = isAdmin();
   const fetchAudits = async () => {
     const d = (await api("/api/audits?status=pending")).data || {};
     items = d.items || [];
+    noAuditor = !!d.no_auditor;
     // 「已完成未提交」不属于谁的待办，只让管理员看一眼（免得有人忘了提交、项目永远不审）
     if (admin) {
       try { drafts = ((await api("/api/audits?status=draft")).data || {}).items || []; }
@@ -710,7 +712,7 @@ async function pendingAuditsDialog() {
   try { await fetchAudits(); } catch (e) { return toast(e.message, "error"); }
 
   openModal({
-    title: "待审核项目",
+    title: admin ? "待复审项目" : "待审核项目",
     body: '<div id="audWrap"></div>',
     footer: '<button class="btn btn-ghost btn-sm" id="audRefresh">刷新</button>'
       + '<button class="btn btn-primary btn-sm" data-close>关闭</button>',
@@ -723,11 +725,13 @@ async function pendingAuditsDialog() {
       };
       const paint = () => {
         const needCnt = items.filter((x) => x.status === "audited").length;
+        const fallback = noAuditor && items.length > needCnt;   // 有 pending 且没人可审
         wrap.innerHTML = `
           <div class="aud-head">共 <b>${items.length}</b> 个待处理项目${needCnt
-            ? `（<b>${needCnt}</b> 个待复审）` : ""}</div>
+            ? `（<b>${needCnt}</b> 个待复审）` : ""}${fallback
+            ? '<br><span style="color:var(--text3)">暂无审核员，待审核项目由管理员处理。</span>' : ""}</div>
           <div class="aud-list">${items.length ? items.map(auditRowHtml).join("")
-            : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>
+            : `<div class="notif-empty">${admin ? "没有待复审项目" : "没有待审核项目"} 🎉</div>`}</div>
           ${drafts.length ? `
             <div class="aud-head" style="margin-top:16px">已完成、<b>未提交审核</b>（<b>${drafts.length}</b> 个）</div>
             <div class="aud-list">${drafts.map(draftRowHtml).join("")}</div>` : ""}`;

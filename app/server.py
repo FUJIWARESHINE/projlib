@@ -325,6 +325,9 @@ def _notify_audit_submitted(audit: dict, user: dict) -> None:
 
     audit_title = f"{code}项目已结项，请审核"
     audit_body = body + "｜复核无误后在消息中心点「审核完成」"
+    if not db.has_auditor():
+        # 兜底发给管理员：标题标明原因，免得管理员以为「审核」也该他做
+        audit_title = f"{code}项目已结项，请审核（暂无审核员）"
     if db.has_auditor():
         _safe_notify(db.add_notification,
                      db.NOTIF_AUDIT_REQUEST, db.ROLE_AUDITOR, audit_title, audit_body,
@@ -365,9 +368,8 @@ def api_audits(query, _b, ctx=None):
 
     ?status=pending（默认）= **待我处理**，按角色分开算：
       · 审核员 → pending（等他复核）；
-      · 管理员 → pending + audited（等他复审）。
-      这是「待审核」统计的唯一口径 —— 以前不分角色只数 pending，
-      审核员一点「审核完成」，管理员那边就定格在 0，可「请复审」的提醒还挂着。
+      · 管理员 → audited（只等复审）；全站没有审核员时才兜底带上 pending。
+      这是「待审核」统计的唯一口径，前端角标 / 待审核弹窗都取这里。
     ?status=draft = 项目已完成、但还没提交审核（只有管理员会看这段，用来提醒处理）；
       它不属于任何人的待办，所以不计入 pending。
     ?status=done / void / skipped / audited / all 查历史（只读展示用）。
@@ -393,6 +395,8 @@ def api_audits(query, _b, ctx=None):
                "draft": db.count_audits("draft"),
                "can_audit": bool(user.get("can_audit")),
                "is_admin": is_admin,
+               # 还没配审核员时，前端的待审核清单会说明「由管理员处理」
+               "no_auditor": not db.has_auditor(),
                "can_submit": _can_submit_audit(user)})
 
 

@@ -2128,21 +2128,21 @@ def list_open_audits(is_admin: bool = False, limit: int = 200,
                      review_only: bool = False) -> list:
     """「待我处理」清单。
 
-    ★ 审核员只算 pending（他复核完就交出去了）；
-      管理员算 pending + audited —— 前者是替审核员兜底（还没配审核员时也能自己审），
-      后者才是他真正的待办「复审」。早期只数 pending，于是审核员一点「审核完成」，
-      管理员那边的待审核统计立刻掉到 0，可「请复审」的提醒还挂在消息中心里。
-    ★ draft（项目已完成、还没提交审核）**不进任何人的待办**：2026-11-06 起它只是
-      一个「谁都能补提交」的中间态，由打勾人自己弹窗确认；只有管理员能在
+    ★ 审核员只算 pending（他复核完就交出去了）。
+    ★ 管理员**只算 audited（复审）**：复核是审核员的活，管理员插进去只会看到
+      同一件事出现在两处（2026-11-06 用户反馈：管理员账号又收到「待审核」卡片）。
+      唯一例外：全站还没配审核员（has_auditor() 为假）时才把 pending 一并给他，
+      否则那条单子没人能审，流程会卡死。
+    ★ draft（项目已完成、还没提交审核）**不进任何人的待办**：它只是一个
+      「谁都能补提交」的中间态，由打勾人自己弹窗确认；只有管理员能在
       「待审核项目」弹窗里看到那一小段清单（见 api_audits?status=draft）。
-    ★ review_only=True：管理员的消息中心工作台只要「待复审」（audited）。
-      提交审核那一刻他已经收到「XX项目已提交审核」这条通知，再给他一张
-      「待审核」卡片就是同一件事在两处出现，看着乱（2026-11-03 用户反馈）。
-      「待审核项目」弹窗 / 审核页仍走默认口径（pending + audited），不丢兜底。
+    ★ review_only=True：消息中心工作台只要「待复审」，与上面的口径一致。
     """
-    if is_admin and review_only:
-        return list_audits(AUDIT_AUDITED, limit=limit)
-    return list_audits("open" if is_admin else AUDIT_PENDING, limit=limit)
+    if is_admin:
+        if review_only or has_auditor():
+            return list_audits(AUDIT_AUDITED, limit=limit)
+        return list_audits("open", limit=limit)
+    return list_audits(AUDIT_PENDING, limit=limit)
 
 
 def void_audit(ptype: str, code: str) -> int:
