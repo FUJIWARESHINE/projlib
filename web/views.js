@@ -138,7 +138,7 @@ VIEWS.dashboard = async (root) => {
     <div class="dash-grid">
       <div class="card">
         <div class="card-head"><h3>各平台完成情况</h3>
-          <span class="hint">已设计该平台的项目数（"/" 未设计不计入）</span>
+          <span class="hint">已设计的项目 · 未设计的不计入</span>
         </div>
         <div class="card-body">
           ${d.platforms.map(platRow).join("")}
@@ -165,9 +165,8 @@ VIEWS.dashboard = async (root) => {
       <div class="card-body">
         <div class="notice info">
           <span>💡</span>
-          <div>月末到了？去 <b>「月末项目统计」</b>：管理员先新建当月统计，各平台实验员登录后填写本平台完成的编号，
-            最后由管理员一键导出标准统计表。
-            ${admin ? "<br>要换数据？去 <b>「导入项目库」</b> 上传新的信息表；想推倒重来，去 <b>「设置 → 数据维护 → 清空项目库」</b>。"
+          <div>月末统计：管理员新建当月统计 → 各平台实验员填写本平台完成的编号 → 管理员一键导出。
+            ${admin ? "<br>批量更新数据请用 <b>「导入项目库」</b>；清空数据在 <b>「设置 → 数据维护」</b>。"
                     : "<br>日常填报可直接在 <b>「项目库」</b> 列表里点自己平台那一列的状态。"}</div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -353,7 +352,7 @@ VIEWS.browse = async (root) => {
           <option value="type"${(B.group || "type") === "type" ? " selected" : ""}>按类型分组</option>
           <option value="all"${B.group === "all" ? " selected" : ""}>全部混排</option>
         </select>
-        <select class="select" id="sortSel" style="width:150px" title="排序依据；默认档（按编号 / 正序）下返修分组按加入日期排，新加入的在最上方">
+        <select class="select" id="sortSel" style="width:150px" title="排序依据">
           <option value="code"${(B.sort || "code") === "code" ? " selected" : ""}>按编号排</option>
           <option value="created"${B.sort === "created" ? " selected" : ""}>按加入日期</option>
           <option value="src"${B.sort === "src" ? " selected" : ""}>按录入顺序</option>
@@ -364,7 +363,7 @@ VIEWS.browse = async (root) => {
         </select>
         <span class="spacer"></span>
         ${canAudit ? `<button class="btn btn-sm audit-entry${auditItems.length ? "" : " zero"}" id="btnAudits"
-          title="项目所有被设计平台都完成后，打勾人确认「提交审核通知」才进审核；审核员复核完还要管理员「复审通过」才算走完流程，没走完的项目都算在这里">
+          title="待我审核 / 复审的项目">
           <span class="aud-dot"></span>待审核<b id="auditCnt">${auditItems.length}</b></button>` : ""}
         <button class="btn btn-ghost btn-sm" id="btnColReset" title="所有列恢复默认宽度">重置列宽</button>
         ${admin ? `
@@ -372,9 +371,7 @@ VIEWS.browse = async (root) => {
           <button class="btn btn-primary btn-sm" id="btnNew">新增项目</button>`
         : `<span class="ro-tag">只读浏览</span>`}
       </div>
-      <div class="hint" style="padding:0 20px 12px">拖动表头右边界可调整列宽（双击恢复该列默认宽度），列宽按浏览器记住。
-        默认排序（按编号 / 正序）下，<b>返修分组按「加入日期」排，新加入的返修项目在最上方</b>；
-        想全部按入库时间排，把「排序依据」切成「按加入日期」。</div>
+      <div class="hint" style="padding:0 20px 12px">拖动表头右边界可调整列宽，双击恢复默认，设置会自动记住。</div>
       <div id="tableWrap"></div>
     </div>`;
 
@@ -406,7 +403,7 @@ VIEWS.browse = async (root) => {
     if (!d.rows.length) {
       $("#tableWrap").innerHTML = `<div class="empty">
         <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 4a2 2 0 0 1 2-2h6l2 3h4a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
-        <p>没有项目。去「导入项目库」导入你的 Excel 试试。</p></div>`;
+        <p>还没有项目。可通过「导入项目库」批量导入。</p></div>`;
       return;
     }
     const pages = Math.max(1, Math.ceil(d.total / d.page_size));
@@ -432,7 +429,7 @@ VIEWS.browse = async (root) => {
               <td>${typePill(r.ptype)}</td>
               <td><span class="code-cell">${esc(r.code)}</span>${
                 (r.seq || 0) > 0
-                  ? `<span class="pill pill-times" title="同一编号的第 ${r.seq + 1} 次记录（如同一个项目多次返修）">×${r.seq + 1}</span>`
+                  ? `<span class="pill pill-times" title="同编号的第 ${r.seq + 1} 条记录">×${r.seq + 1}</span>`
                   : ""}</td>
               <td><div class="name-wrap"><span class="name-cell" title="${esc(r.name)}">${esc(r.name)}</span>${
                 submitTag(r, !!d.can_submit_audit)}</div></td>
@@ -462,12 +459,16 @@ VIEWS.browse = async (root) => {
 
     $$("[data-edit]").forEach((b) => b.addEventListener("click", () => editProject(Number(b.dataset.edit), load)));
     bindInline();
-    // 「待提交审核」标签：点一下就补提交（通知审核员复核）
-    $$("[data-submit-audit]").forEach((b) => b.addEventListener("click", async () => {
-      if (!confirm("提交审核通知？提交后审核员会收到「项目已结项，请审核」的提醒。")) return;
-      b.disabled = true;
-      const done = await submitAuditNow(Number(b.dataset.submitAudit));
-      if (done) load(); else b.disabled = false;
+    // 「待提交审核」标签：点开同一个三选一弹窗（提交 / 稍后通知 / 不提交）
+    $$("[data-submit-audit]").forEach((b) => b.addEventListener("click", () => {
+      const row = B.data.rows.find((x) => String(x.audit_id) === String(b.dataset.submitAudit)) || {};
+      const t = (state.types || []).find((x) => x.key === row.ptype);
+      askSubmitAudit({
+        audit_id: Number(b.dataset.submitAudit),
+        ptype: row.ptype, type_label: t ? t.label : "",
+        code: row.code, name: row.name, project_id: row.id,
+        done_labels: "", reopened: false,
+      }, load);
     }));
     $$("[data-pg]").forEach((b) => b.addEventListener("click", () => {
       B.page += b.dataset.pg === "next" ? 1 : -1;
@@ -554,16 +555,29 @@ VIEWS.browse = async (root) => {
 };
 
 /* ------------------------------------------------ 「要不要提交审核」的确认弹窗 */
-/* 2026-11-06 起**不再自动审核**：最后一个平台被勾成 ✅ 时，后端只落一张
-   「待提交审核(draft)」的单子、不给任何人发通知，由打勾的人在这里决定：
+/* 最后一个平台被勾成 ✅ 时，后端只落一张「待提交审核(draft)」的单子、不发通知，
+   由打勾的人在这里三选一：
      · 提交审核通知 → POST /api/audits/<id>/submit，审核员这时才收到「请审核」；
-     · 稍后再说     → 什么都不发，项目标成「待提交审核」，之后还能在列表里补提交。 */
+     · 稍后通知     → 留在「待提交审核」，之后能在项目库列表里补提交；
+     · 不提交       → POST /api/audits/<id>/skip，这一轮不做审核，不再提示。 */
 async function submitAuditNow(auditId) {
   try {
     await api("/api/audits/" + auditId + "/submit", { method: "POST", body: {} });
     toast("已提交审核，已通知审核员复核");
     loadNotifications({ popup: false }).catch(() => {});   // 同步右上角角标
     refreshAuditBadge();                                   // 同步顶部「待审核 N」
+    return true;
+  } catch (e) {
+    toast(e.message, "error");
+    return false;
+  }
+}
+
+/* 「不提交」：把这张待提交的单子收掉，不通知任何人 */
+async function skipAuditNow(auditId) {
+  try {
+    await api("/api/audits/" + auditId + "/skip", { method: "POST", body: {} });
+    toast("已标记为不提交审核");
     return true;
   } catch (e) {
     toast(e.message, "error");
@@ -592,21 +606,20 @@ function askSubmitAudit(info, after) {
     body: `
       <div class="notice info" style="margin:0 0 14px">
         <span>🏁</span>
-        <div><b>${esc(info.code)}</b> 项目所有被设计平台的实验都已完成。${
-          info.reopened ? "这轮内容有变更，审核流程需要重新走一遍。" : ""}</div>
+        <div><b>${esc(info.code)}</b> 各平台实验已全部完成。${
+          info.reopened ? "内容有变更，需重新确认。" : ""}</div>
       </div>
-      <div class="hint" style="line-height:2">
-        <div>· <b>提交审核通知</b>：审核员会立刻收到「${esc(info.code)}项目已结项，请审核」的提醒，
-          复核完成后再由管理员复审通过。</div>
-        <div>· <b>稍后再说</b>：现在不通知任何人，项目会标成<b>「待提交审核」</b>，
-          之后可以在项目库列表里补提交。</div>
+      <div class="hint" style="line-height:1.9">
+        <div><b>提交审核通知</b>：立刻通知审核员复核。</div>
+        <div><b>稍后通知</b>：先记为「待提交审核」，之后可在项目库补提交。</div>
+        <div><b>不提交</b>：这一轮不做审核。</div>
       </div>
       <div class="hint" style="margin-top:12px">${meta}</div>`,
     footer: `<span style="flex:1"></span>
-      <button class="btn btn-ghost" data-close>稍后再说</button>
+      <button class="btn btn-ghost" data-skip>不提交</button>
+      <button class="btn btn-ghost" data-close>稍后通知</button>
       <button class="btn btn-primary" data-submit>提交审核通知</button>`,
-    // 关掉弹窗（提交完 / 稍后再说 / 点遮罩）都刷新一次列表：
-    // 提交完要看「待审核」状态，稍后再说要让「待提交审核」标签立刻出现。
+    // 关掉弹窗都刷新一次列表：提交后看「待审核」，稍后/不提交要让标记同步变化。
     onClose() { if (typeof after === "function") after(); },
     onMount(root) {
       $("[data-submit]", root).addEventListener("click", async (ev) => {
@@ -617,6 +630,15 @@ function askSubmitAudit(info, after) {
         if (!done) return;
         closeModal();          // 关窗即触发 onClose → 刷新列表
       });
+      $("[data-skip]", root).addEventListener("click", async (ev) => {
+        if (!confirm("确定不提交审核？该项目这一轮不会进入审核流程。")) return;
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        const done = await skipAuditNow(info.audit_id);
+        btn.disabled = false;
+        if (!done) return;
+        closeModal();
+      });
     },
   });
 }
@@ -625,10 +647,10 @@ function askSubmitAudit(info, after) {
 function submitTag(r, canSubmit) {
   if (!r || r.audit_status !== "draft") return "";
   if (!canSubmit) {
-    return `<span class="pill pill-tosubmit" title="项目已完成，等打勾人点「提交审核通知」">待提交审核</span>`;
+    return `<span class="pill pill-tosubmit" title="已完成，待提交审核">待提交审核</span>`;
   }
   return `<button class="pill pill-tosubmit" data-submit-audit="${r.audit_id}"
-    title="项目已全部完成但还没提交审核 · 点这里通知审核员复核">待提交审核</button>`;
+    title="点击提交审核">待提交审核</button>`;
 }
 
 /* ------------------------------------------------ 待审核项目（项目库模块入口） */
@@ -647,8 +669,8 @@ function auditRowHtml(a) {
         <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span>
         ${need ? '<span class="ni-tag ni-lock">待复审</span>' : ""}</div>
       <div class="aud-sub">${need
-        ? `复核人 ${esc(a.auditor_name) || "—"} · 复核时间 ${esc(notifTime(a.reviewed_at)) || "—"} · 等管理员复审`
-        : `结项时间 ${esc(notifTime(a.created_at)) || "—"} · 已全部平台完成，待复核`}</div>
+        ? `复核人 ${esc(a.auditor_name) || "—"} · ${esc(notifTime(a.reviewed_at)) || "—"} · 待复审`
+        : `结项 ${esc(notifTime(a.created_at)) || "—"} · 待复核`}</div>
     </div>
     ${need
       ? `<button class="btn btn-primary btn-sm" data-rev="${a.id}">复审通过</button>`
@@ -665,7 +687,7 @@ function draftRowHtml(a) {
         title="在项目库里查看这个项目">${esc(a.code)}</b>
         <span class="aud-name" title="${esc(a.name)}">${esc(a.name) || "—"}</span>
         <span class="ni-tag">待提交审核</span></div>
-      <div class="aud-sub">结项时间 ${esc(notifTime(a.created_at)) || "—"} · 还没提交审核通知，审核员不会收到提醒</div>
+      <div class="aud-sub">结项 ${esc(notifTime(a.created_at)) || "—"} · 未提交审核</div>
     </div>
     <button class="btn btn-primary btn-sm" data-submit-aud="${a.id}">提交审核</button>
   </div>`;
@@ -702,14 +724,12 @@ async function pendingAuditsDialog() {
       const paint = () => {
         const needCnt = items.filter((x) => x.status === "audited").length;
         wrap.innerHTML = `
-          <div class="aud-head">当前共 <b>${items.length}</b> 个待处理项目${needCnt
-            ? `（其中 <b>${needCnt}</b> 个已复核、等你复审）` : ""}${items.length
-            ? "。审核员复核无误后点「审核完成」，管理员收到复审提醒；管理员复核无误后点「复审通过」，这一轮才算走完。" : "。"}</div>
+          <div class="aud-head">共 <b>${items.length}</b> 个待处理项目${needCnt
+            ? `（<b>${needCnt}</b> 个待复审）` : ""}</div>
           <div class="aud-list">${items.length ? items.map(auditRowHtml).join("")
             : '<div class="notif-empty">没有待审核项目 🎉</div>'}</div>
           ${drafts.length ? `
-            <div class="aud-head" style="margin-top:16px">已完成、但<b>还没提交审核</b>的项目（<b>${drafts.length}</b> 个）：
-              打勾人没点「提交审核通知」就不会打扰审核员，这里可以代为补提交。</div>
+            <div class="aud-head" style="margin-top:16px">已完成、<b>未提交审核</b>（<b>${drafts.length}</b> 个）</div>
             <div class="aud-list">${drafts.map(draftRowHtml).join("")}</div>` : ""}`;
         syncEntry();
         // 点编号 → 关弹窗并在项目库里搜这个编号（审核前先核对项目内容）
@@ -748,7 +768,7 @@ async function pendingAuditsDialog() {
         $$("[data-submit-aud]", wrap).forEach((b) => b.addEventListener("click", async (ev) => {
           ev.stopPropagation();
           const btn = ev.currentTarget;
-          if (!confirm("提交审核通知？提交后审核员会收到「项目已结项，请审核」的提醒。")) return;
+          if (!confirm("确定提交审核？审核员会收到提醒。")) return;
           btn.disabled = true;
           const done = await submitAuditNow(Number(btn.dataset.submitAud));
           if (!done) { btn.disabled = false; return; }
@@ -784,7 +804,7 @@ function editProject(id, reload) {
       title: isNew ? "新增项目" : "编辑项目",
       wide: true,
       body: `
-        ${isNew ? "" : `<div class="hint" style="margin:0 0 12px">改「项目类型」就能把项目换个分类（如库存 → 加急），不必删除后重建。</div>`}
+        ${isNew ? "" : `<div class="hint" style="margin:0 0 12px">项目类型、编号均可直接修改。</div>`}
         <div class="grid2">
           <div class="field"><label>项目类型</label>
             <select class="select" id="f_ptype">
@@ -896,9 +916,8 @@ VIEWS.import = async (root) => {
   root.innerHTML = `
     <div class="notice info">
       <span>💡</span>
-      <div>导入项目信息表：程序会自动识别
-        <b>真实 / 加急 / 返修 / 库存</b> 各张工作表，按「类型 + 项目编号」覆盖更新——
-        编号已存在的更新，新的则新增。源文件不会被修改。</div>
+      <div>上传 Excel 即可导入：识别 <b>真实 / 加急 / 返修 / 库存</b> 工作表，
+        同编号的项目更新，新编号新增。源文件不会被修改。</div>
     </div>
 
     <div class="card">
@@ -960,8 +979,7 @@ VIEWS.import = async (root) => {
     const labelMap = { real: "真实", urgent: "加急", stock: "库存", repair: "返修" };
     const reps = Object.entries(d.repeats || {});
     const repTip = reps.length
-      ? `<div class="hint" style="margin-top:8px">其中 ${reps.length} 个编号在表里出现多次
-         （同一项目多次返修 / 多行报价），已<b>全部保留</b>，没有丢行：
+      ? `<div class="hint" style="margin-top:8px">其中 ${reps.length} 个编号出现多次，已全部保留：
          ${reps.slice(0, 8).map(([c, n]) => `${esc(c)}×${n + 1}`).join("、")}${reps.length > 8 ? " …" : ""}</div>`
       : "";
     $("#previewCard").style.display = "";
@@ -1011,8 +1029,8 @@ VIEWS.import = async (root) => {
     const total = Object.values(data.by_type || {}).reduce((a, b) => a + b, 0);
     $("#previewBody").innerHTML = `
       <div class="notice info" style="margin-bottom:12px"><span>🔍</span>
-        <div>共识别 <b>${total}</b> 条项目记录，来自 ${sheets.filter(s=>!s.skipped).length} 张工作表。
-          确认无误后点右上角「导入 / 更新」写入数据库。</div></div>
+        <div>共识别 <b>${total}</b> 条记录，来自 ${sheets.filter(s=>!s.skipped).length} 张工作表。
+          确认无误后点右上角「导入 / 更新」。</div></div>
       <div class="sheet-preview">
         ${sheets.map((s) => `
           <div class="sheet-card">
@@ -1081,7 +1099,7 @@ VIEWS.month = async (root) => {
   if (!M.mid) {
     $("#monthMain").innerHTML = `<div class="card"><div class="empty">
       <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4M16 2v4M3 10h18"/></svg>
-      <p>${admin ? "还没有任何月份统计。点左侧「新建月份」创建，比如「2026年9月」。" : "还没有月份统计，请等待管理员创建。"}</p>
+      <p>${admin ? "还没有月份，点左侧「新建月份」开始。" : "还没有月份统计，请等待管理员创建。"}</p>
       </div></div>`;
     return;
   }
@@ -1428,9 +1446,7 @@ function entryCodesDialog(platform, mode) {
     body: `
       <div class="notice info" style="margin-bottom:14px"><span>${editing ? "✏️" : "💡"}</span>
         <div>${editing
-          ? `本平台当月四类编号已<b>全部列出</b>，直接在框里改，改完点保存一次到位：
-             删掉某行 = 移除该编号；把它剪切到别的类型框 = 改归类；新加一行 = 新增；
-             某个类型框清空即表示该类型下没有编号。`
+          ? `四类编号已全部列出，直接修改后保存：删除即移除，剪切到别的类型即改归类。`
           : `向 <b>${esc(platLabel)}</b> 平台一次性添加当月完成的编号：<b>四类可同时填写</b>，
              哪个类型下有编号就填在对应框里（用不到的留空即可）。`}
           <br>每行一个编号，也可用逗号 / 空格分隔；编号不区分大小写（填 <code>a384</code> 也能匹配到 <code>A384</code>）。
@@ -1583,8 +1599,7 @@ function editEntryDialog(entryId) {
     title: "编辑填报编号",
     body: `
       <div class="notice info" style="margin-bottom:14px"><span>✏️</span>
-        <div>编号填错了直接改就行，<b>不用删掉重加</b>；类型 / 平台也可以在这里换
-          （页面上把编号拖到别的列效果一样）。改完项目名与报价会重新匹配。</div></div>
+        <div>可直接修改编号、类型与平台。</div></div>
       <div class="field"><label>项目编号</label>
         <input class="input" id="eeCode" value="${esc(it.code)}" placeholder="如 A384" autocomplete="off"></div>
       <div class="grid2" style="margin-top:14px">
@@ -1755,8 +1770,7 @@ function editMonthDialog(month) {
     title: "编辑统计月份",
     body: `
       <div class="notice info" style="margin-bottom:14px"><span>✏️</span>
-        <div>改的是这个月份的<b>名称与年月</b>；各平台<b>已填写的编号一条都不会丢</b>，
-          不用删掉整个统计重建。</div></div>
+        <div>修改月份名称与年月，已填报的数据不受影响。</div></div>
       <div class="field"><label>月份名称</label>
         <input class="input" id="emName" value="${esc(month.name)}" placeholder="如 2026年9月"></div>
       <div class="grid2" style="margin-top:14px">
@@ -1925,8 +1939,8 @@ function rcptBodyHtml(d, tab) {
       <div class="rcpt-stat"><b>${people.length}</b><span>受众</span></div>
       ${cleared ? `<div class="rcpt-stat warn"><b>${cleared}</b><span>清空时标已读</span></div>` : ""}
     </div>
-    ${cleared ? `<div class="rcpt-tip">其中 ${cleared} 人是在「清空消息中心」时被顺带标成已读的，
-      不代表真的点开看过这条通告。</div>` : ""}
+    ${cleared ? `<div class="rcpt-tip">其中 ${cleared} 人在清空消息时被自动标记为已读。
+      </div>` : ""}
     <div class="rcpt-tabs" id="rcptTabs">
       ${RCPT_TABS.map((t) => `<button type="button" class="rcpt-tab${t.key === tab ? " on" : ""}"
         data-rcpt-tab="${t.key}">${t.label}<b>${countOf[t.key]}</b></button>`).join("")}
@@ -2008,16 +2022,14 @@ async function loadNoticePage(root) {
           </div>
           <label class="bc-check">
             <input type="checkbox" id="bcPopup" checked>
-            <span><b>登录后弹窗提醒</b>：接收者登录（或正开着页面）时会弹出提醒横幅，
-              直到他点开看过为止。不勾选则只进消息中心。</span>
+            <span><b>登录后弹窗提醒</b>：成员登录时弹出提醒，看过即停；不勾选则只进消息中心。</span>
           </label>
           <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
             <button class="btn btn-primary" id="bcSend">发布通告</button>
             <button class="btn btn-ghost" id="bcTpl">填入「月末统计提醒」模板</button>
           </div>
           <div class="bc-tip">
-            发布平台留空 = 全体成员（含运营 / 设计等只读岗位）；
-            通告发出后管理员自己的消息中心不会出现这条（它是发给成员干活的）。
+            不选平台即发全体成员；通告不会出现在自己的消息中心。
           </div>
         </div>
       </div>
@@ -2106,12 +2118,9 @@ VIEWS.users = async (root) => {
   root.innerHTML = `
     <div class="notice info">
       <span>👥</span>
-      <div><b>管理员</b>可管理项目库、导入数据、导出文件，并管理账号；
-        <b>普通用户</b>只能填写自己所属平台的板块（运营/设计为只读）。
-        「<b>开启审核</b>」给某个普通账号加上<b>审核功能</b>：项目全部完成、打勾人确认「提交审核通知」后，
-        他会收到弹窗提醒；复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。
-        ⚠️ 通知里显示的是账号的<b>「姓名」</b>，不是登录用户名；没填姓名的账号会被写成「账号 xxx」，
-        建议都补上。自助注册只能创建普通用户，管理员账号请在此处新增。</div>
+      <div><b>管理员</b>可管理项目库、导入导出数据、管理账号；<b>普通用户</b>只能填报本平台。
+       「<b>开启审核</b>」后，该账号可复核结项项目并收到审核提醒。
+       通知与审核记录中显示<b>姓名</b>，建议为每个账号填写。</div>
     </div>
     <div class="card">
       <div class="card-head"><h3>账号列表（${users.length}）</h3>
@@ -2134,7 +2143,7 @@ VIEWS.users = async (root) => {
               return `<tr data-uid="${u.id}">
               <td><span class="code-cell">${esc(u.username)}</span>${isBuiltin ? ' <span class="pill" style="font-size:10px">内置</span>' : ""}</td>
               <td>${noName ? `<span style="color:var(--text3)">${esc(u.username)}</span>
-                  <span class="pill warn" style="font-size:10px" title="该账号没单独填姓名，通知里会显示成「账号 ${esc(u.username)}」；点「编辑」补上姓名即可">未填姓名</span>`
+                  <span class="pill warn" style="font-size:10px" title="未填姓名，点「编辑」补充">未填姓名</span>`
                 : esc(u.display_name)}</td>
               <td>${u.role === "admin"
                 ? '<span class="pill admin">管理员</span>'
@@ -2144,7 +2153,7 @@ VIEWS.users = async (root) => {
                 ? '<span style="color:var(--text3);font-size:12px">—</span>'
                 : `<button class="btn btn-sm ${u.can_audit ? "btn-green" : "btn-ghost"}"
                      data-audit-user="${u.id}" data-on="${u.can_audit ? 1 : 0}"
-                     title="${u.can_audit ? "该账号可复核结项项目；点击取消" : "点击开启：项目结项后会收到「请审核」弹窗提醒"}">
+                     title="${u.can_audit ? "点击取消审核功能" : "点击开启审核功能"}">
                      ${u.can_audit ? "审核员 ✓" : "开启审核"}</button>`}</td>
               <td>${u.active ? '<span class="st done">正常</span>' : '<span class="st undone">停用</span>'}</td>
               <td>${esc(u.last_login || "—")}</td>
@@ -2167,9 +2176,7 @@ VIEWS.users = async (root) => {
     const uid = b.dataset.auditUser;
     const on = b.dataset.on === "1";
     const u = users.find((x) => String(x.id) === String(uid)) || {};
-    if (!on && !confirm(`给「${personLabel(u)}」开启审核功能？\n\n`
-      + `开启后，项目全部完成且打勾人提交审核通知时，该账号会收到「请审核」弹窗提醒，\n`
-      + `复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。`)) return;
+    if (!on && !confirm(`给「${personLabel(u)}」开启审核功能？\n\n开启后可复核结项项目，并收到审核提醒。`)) return;
     try {
       await api("/api/users/" + uid, { method: "PUT", body: { can_audit: !on } });
       toast(on ? "已取消审核功能" : "已开启审核功能");
@@ -2217,9 +2224,8 @@ function rolePlatformFields(role, platform, canAudit) {
       <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer">
         <input type="checkbox" id="u_audit"${canAudit ? " checked" : ""} style="width:auto;margin-top:3px">
         <span style="font-size:12.5px;color:var(--text2);line-height:1.55">
-          <b>开启审核功能</b>：项目全部完成、打勾人点「提交审核通知」后，该账号会收到「请审核」弹窗提醒；
-          复核完点「审核完成」，管理员会收到「某某某已审核完成，请复审」。<br>
-          <span style="color:var(--text3)">（只对普通用户有效，管理员不需要）</span>
+          <b>开启审核功能</b>：该账号可复核结项项目，并收到审核提醒。
+          <span style="color:var(--text3)">（仅普通用户）</span>
         </span>
       </label></div>`;
 }
@@ -2245,8 +2251,8 @@ function newUserDialog() {
         <div>可创建<b>普通用户</b>（需选岗位）或<b>管理员</b>（拥有全部权限）。</div></div>
       <div class="field"><label>用户名</label>
         <input class="input" id="u_name" placeholder="至少 3 个字符"></div>
-      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知里显示这个，建议必填）</span></label>
-        <input class="input" id="u_display" placeholder="如：张小凡；留空则通知里显示「账号 + 登录名」"></div>
+      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知中显示）</span></label>
+        <input class="input" id="u_display" placeholder="如：张小凡"></div>
       <div class="field" style="margin-top:12px"><label>初始密码</label>
         <input class="input" id="u_pwd" placeholder="至少 6 位"></div>
       ${rolePlatformFields("user", "cell", false)}`,
@@ -2284,9 +2290,9 @@ function editUserDialog(u, isSelf) {
         <div>这是你当前登录的账号，请勿把自己降级为普通用户或停用，以免失去管理员权限。</div></div>` : ""}
       <div class="field"><label>用户名</label>
         <input class="input" value="${esc(u.username)}" disabled></div>
-      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知 / 审核记录里显示这个）</span></label>
+      <div class="field" style="margin-top:12px"><label>姓名 <span style="color:var(--text3);font-weight:400">（通知与审核记录中显示）</span></label>
         <input class="input" id="e_display" value="${noNameOf(u) ? "" : esc(u.display_name)}"
-          placeholder="如：张小凡；留空则通知里显示「账号 + 登录名」"></div>
+          placeholder="如：张小凡"></div>
       ${rolePlatformFields(u.role, u.platform, !!u.can_audit)}`,
     footer: `<span style="flex:1"></span>
       <button class="btn btn-ghost" data-close>取消</button>
@@ -2453,8 +2459,8 @@ VIEWS.settings = async (root) => {
             <button class="btn btn-ghost" id="btnBackup">备份数据库</button>
             <button class="btn btn-danger" id="btnClearLib">清空项目库</button>
           </div>
-          <div class="hint" style="margin-top:10px">数据全部保存在服务器容器内的数据卷中，重启不丢失。</div>
-          <div class="hint" style="margin-top:6px">「清空项目库」会删除当前全部项目（<b>不影响</b>用户账号、系统设置与月末统计填报）；程序不内置任何项目数据，请用「导入项目库」自己导入。</div>
+          <div class="hint" style="margin-top:10px">数据保存在服务器上，重启不丢失。</div>
+          <div class="hint" style="margin-top:6px">「清空项目库」只删除项目数据，<b>不影响</b>账号、设置与月末统计。</div>
         </div>
       </div>
 
@@ -2559,7 +2565,7 @@ VIEWS.settings = async (root) => {
           } catch (e) { toast(e.message, "error"); }
           return;
         }
-        if (!confirm(`用这份备份覆盖当前数据库？\n\n${name}\n\n· 覆盖前会自动把当前数据库另存一份（before-restore）\n· 恢复后所有人可能需要重新登录\n· 建议恢复完刷新页面`)) return;
+        if (!confirm(`用这份备份覆盖当前数据库？\n\n${name}\n\n恢复前会自动备份当前数据库，恢复后请刷新页面。`)) return;
         try {
           const res = await api("/api/backup/restore", { method: "POST", body: { name } });
           const d = res.data;

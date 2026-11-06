@@ -368,17 +368,17 @@ def api_audits(query, _b, ctx=None):
       · 管理员 → pending + audited（等他复审）。
       这是「待审核」统计的唯一口径 —— 以前不分角色只数 pending，
       审核员一点「审核完成」，管理员那边就定格在 0，可「请复审」的提醒还挂着。
-    ?status=draft = 项目已完成、但打勾人还没点「提交审核通知」（只有管理员会看这段，
-      用来催 / 代提交）；它不属于任何人的待办，所以不计入 pending。
-    ?status=done / void / audited / all 查历史（只读展示用）。
+    ?status=draft = 项目已完成、但还没提交审核（只有管理员会看这段，用来提醒处理）；
+      它不属于任何人的待办，所以不计入 pending。
+    ?status=done / void / skipped / audited / all 查历史（只读展示用）。
     """
     user = (ctx or {}).get("user") or {}
     is_admin = auth.is_admin(user)
     if not (user.get("can_audit") or is_admin):
         return fail("没有审核权限", 403)
     status = (query.get("status", ["pending"])[0] or "pending").strip()
-    if status not in ("pending", "open", "audited", "draft", "done", "void", "all"):
-        return fail("status 不合法", 400)
+    if status not in ("pending", "open", "audited", "draft", "done", "void", "skipped", "all"):
+        return fail("参数有误，请刷新页面后重试", 400)
     if status in ("pending", "open"):
         items = db.list_open_audits(is_admin)
     elif status == "all":
@@ -416,6 +416,26 @@ def api_submit_audit(_q, _b, aid, ctx=None):
     if not audit:
         return fail("提交失败，请刷新后重试", 409, audit=db.get_audit(aid))
     return ok({"audit": audit})
+
+
+def api_skip_audit(_q, _b, aid, ctx=None):
+    """打勾人选「不提交」：draft → skipped，不发通知、不再提示。
+
+    与「稍后通知」的区别：稍后通知只是把单子留在「待提交审核」等以后再点，
+    不提交则是明确放弃这一轮审核，列表里也不会再出现「待提交审核」标记。
+    """
+    user = (ctx or {}).get("user") or {}
+    if not _can_submit_audit(user):
+        return fail("没有提交审核的权限", 403)
+    cur = db.get_audit(aid)
+    if not cur:
+        return fail("该审核记录不存在", 404)
+    if cur.get("status") != db.AUDIT_DRAFT:
+        return fail(f"该项目{cur.get('status_name') or '已处理'}，无需再操作", 409, audit=cur)
+    skipped = db.skip_audit(aid)
+    if not skipped:
+        return fail("操作失败，请刷新后重试", 409, audit=db.get_audit(aid))
+    return ok({"audit": skipped})
 
 
 def api_audit_done(_q, _b, aid, ctx=None):
@@ -526,7 +546,7 @@ def api_notifications_read(_q, body, ctx=None):
     else:
         ids = body.get("ids") or []
         if not isinstance(ids, list):
-            return fail("ids 参数不合法", 400)
+            return fail("操作有误，请刷新页面后重试", 400)
         db.mark_notifications_read(uid, ids, roles, plat)
     return ok({"unread": db.notif_unread_count(
         uid, roles, plat, can_audit=bool(user.get("can_audit")))})
@@ -590,10 +610,10 @@ def api_broadcast_create(_q, body, ctx=None):
     if platforms is None:
         platforms = []
     if not isinstance(platforms, list):
-        return fail("platforms 参数不合法", 400)
+        return fail("接收平台选择有误", 400)
     bad = [str(p) for p in platforms if str(p) not in db.BROADCAST_PLATFORM_KEYS]
     if bad:
-        return fail("平台参数不合法：" + "、".join(bad[:4]), 400)
+        return fail("接收平台有误：" + "、".join(bad[:4]), 400)
     item = db.add_broadcast(title, text, [str(p) for p in platforms],
                             bool(body.get("popup", True)),
                             created_by=int(user.get("id") or 0))
@@ -712,7 +732,7 @@ _VALID_TYPES = {k for k, _ in db.TYPES}
 def api_create_project(_q, body, ctx=None):
     ptype = str(body.get("ptype") or "").strip()
     if ptype not in _VALID_TYPES:
-        return fail("项目类型不合法", 400)
+        return fail("请选择项目类型", 400)
     try:
         pid = db.upsert_project(body)
     except Exception as exc:  # noqa: BLE001
@@ -733,7 +753,7 @@ def api_update_project(_q, body, pid, ctx=None):
     # 归属类型可以改（项目从库存转加急等），但要挡住非法值
     ptype = str(body.get("ptype") or "").strip()
     if ptype and ptype not in _VALID_TYPES:
-        return fail("项目类型不合法", 400)
+        return fail("请选择项目类型", 400)
     before = db.get_project(pid)
     if not before:
         return fail("项目不存在", 404)
@@ -767,9 +787,9 @@ def api_set_platform_status(_q, body, pid, ctx=None):
     value = body.get("value")
     value = "" if value is None else str(value).strip()
     if plat not in ("cell", "mol", "path", "animal"):
-        return fail("平台参数不合法", 400)
+        return fail("请选择平台", 400)
     if value not in ("", "/", "✅", "❌"):
-        return fail("状态值不合法", 400)
+        return fail("请选择有效状态", 400)
     if not auth.can_edit_platform(user, plat):
         return fail("没有该平台的填报权限", 403)
     before = db.get_project(pid)
@@ -804,8 +824,8 @@ def api_import_preview(_q, body):
         return path
     try:
         parsed = importer.parse_workbook(path)
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"解析失败：{exc}")
+    except Exception:  # noqa: BLE001
+        return fail("文件解析失败，请确认是项目信息表")
     finally:
         _cleanup_upload(path)
     by_type = {k: len(v) for k, v in parsed["data"].items()}
@@ -833,8 +853,8 @@ def api_import_run(_q, body, ctx=None):
                 result["kept"] = keep
             except Exception:  # noqa: BLE001
                 pass
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"导入失败：{exc}")
+    except Exception:  # noqa: BLE001
+        return fail("导入失败，请检查文件格式后重试")
     finally:
         _cleanup_upload(path)
     if not result.get("ok"):
@@ -850,8 +870,8 @@ def api_import_path(_q, body, ctx=None):
         return fail("文件不存在：" + path)
     try:
         result = importer.import_workbook(path, mode=body.get("mode") or "upsert")
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"导入失败：{exc}")
+    except Exception:  # noqa: BLE001
+        return fail("导入失败，请检查文件格式后重试")
     if not result.get("ok"):
         return fail(result.get("error") or "导入失败")
     _notify_after_import(result, ctx)
@@ -873,9 +893,9 @@ def _save_upload(body):
     try:
         with open(tmp_path, "wb") as f:
             f.write(base64.b64decode(content.split(",")[-1]))
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        return fail(f"文件写入失败：{exc}")
+        return fail("保存上传文件失败，请重试")
     return tmp_path
 
 
@@ -902,8 +922,8 @@ def api_pick_file(_q, _b):
         )
         root.destroy()
         return ok({"path": path or ""})
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"选择文件失败：{exc}")
+    except Exception:  # noqa: BLE001
+        return fail("打开文件失败，请重试")
 
 
 # ---------------------------------------------------------------- 查询 / 导出
@@ -1237,9 +1257,9 @@ def api_month_move_entry(_q, body, mid, eid, ctx):
         if _bad:
             return _bad      # 单条改编号也要带字母前缀（拖动只改归类、不带 code，不受影响）
     if platform not in db.PLATFORM_KEYS:
-        return fail("平台不合法", 400)
+        return fail("请选择平台", 400)
     if ptype not in db.TYPE_NAME:
-        return fail("项目类型不合法", 400)
+        return fail("请选择项目类型", 400)
     if not auth.can_edit_platform(user, platform):
         return fail("你没有目标平台板块的操作权限", 403)
     try:
@@ -1511,8 +1531,8 @@ def api_backup_browse(query, _b):
                 dirs.append({"name": e.name, "path": e.path})
     except PermissionError:
         return fail("没有权限读取该目录")
-    except OSError as exc:
-        return fail(f"读取目录失败：{exc}")
+    except OSError:
+        return fail("无法读取该目录")
     dirs.sort(key=lambda d: d["name"].lower())
     parent = os.path.dirname(path)
     if parent == path:
@@ -1547,16 +1567,16 @@ def api_backup_pick_dir(_q, _b):
         path = filedialog.askdirectory(title="选择数据库备份文件夹", mustexist=False)
         root.destroy()
         return ok({"path": path or ""})
-    except Exception as exc:  # noqa: BLE001
-        return fail(f"选择文件夹失败：{exc}")
+    except Exception:  # noqa: BLE001
+        return fail("打开文件夹失败，请重试")
 
 
 def api_package(_q, _b):
     if not getattr(sys, "frozen", False):
-        return fail("此功能仅打包后的 exe 支持")
+        return fail("当前环境不支持该操作")
     src_db = db.get_db_path()
     if not os.path.exists(src_db):
-        return fail("尚未创建数据库，请先使用一次程序")
+        return fail("暂无数据，请先导入项目库")
     name = f"项目库统计程序_分发包_{datetime.now():%Y%m%d}.zip"
     path = os.path.join(db.get_app_dir(), name)
     try:
@@ -1626,6 +1646,7 @@ ROUTES = [
     # ---- 结项审核（三段式：提交审核 → 审核员复核 → 管理员复审）
     ("GET", re.compile(r"^/api/audits$"), api_audits),
     ("POST", re.compile(r"^/api/audits/(\d+)/submit$"), api_submit_audit),
+    ("POST", re.compile(r"^/api/audits/(\d+)/skip$"), api_skip_audit),
     ("POST", re.compile(r"^/api/audits/(\d+)/done$"), api_audit_done),
     ("POST", re.compile(r"^/api/audits/(\d+)/confirm$"), api_audit_confirm),
     # ---- 全服通告（仅管理员：发布 / 查看已发布 / 撤回）
@@ -1662,7 +1683,7 @@ CTX_AWARE = {api_auth_me, api_create_month, api_month_detail,
              api_create_project, api_update_project, api_import_run, api_import_path,
              api_notifications, api_notifications_read, api_notifications_clear,
              api_list_projects,
-             api_audits, api_submit_audit, api_audit_done, api_audit_confirm,
+             api_audits, api_submit_audit, api_skip_audit, api_audit_done, api_audit_confirm,
              api_broadcasts, api_broadcast_create, api_broadcast_reads,
              api_broadcast_delete,
              api_worklogs_list, api_worklog_create, api_worklog_update,
@@ -1825,7 +1846,8 @@ class Handler(BaseHTTPRequestHandler):
             result = dispatch(method, path, parse_qs(parsed.query), body,
                               session_token=self._session_token())
         except Exception as exc:  # noqa: BLE001
-            return self._json(500, {"ok": False, "error": f"服务异常：{exc}"})
+            print(f"[500] {method} {path}：{exc}", file=sys.stderr, flush=True)
+            return self._json(500, {"ok": False, "error": "服务器内部错误，请稍后重试"})
         if result is None:
             return self._json(404, {"ok": False, "error": "接口不存在"})
         # 文件下载：handler 直接返回 ("FILE", content, ctype, fname)

@@ -1959,6 +1959,7 @@ def delete_broadcast(bid: int) -> bool:
 # ================================================================== 结项审核
 # 状态机（三段式，2026-11-06 起）：
 #   draft --打勾人点「提交审核通知」--> pending
+#   draft --打勾人点「不提交」--> skipped（终态：不通知任何人，记录留档）
 #   pending --审核员「审核完成」--> audited --管理员「复审通过」--> done
 #   draft / pending / audited --项目退出已完成 / 退回返工--> void
 #   内容变更（平台完成情况变过）→ 重置回 draft，由打勾人重新确认提交。
@@ -1966,12 +1967,14 @@ AUDIT_DRAFT = "draft"
 AUDIT_PENDING = "pending"
 AUDIT_AUDITED = "audited"
 AUDIT_DONE = "done"
+AUDIT_SKIPPED = "skipped"
 AUDIT_VOID = "void"
 AUDIT_STATUS_NAME = {
     AUDIT_DRAFT: "待提交审核",
     AUDIT_PENDING: "待审核",
     AUDIT_AUDITED: "已复核待复审",
     AUDIT_DONE: "已复审通过",
+    AUDIT_SKIPPED: "未提交审核",
     AUDIT_VOID: "已撤回（项目退回未完成）",
 }
 # 「还没处理完」的状态：审核员看待办只认 pending，管理员再加上待复审。
@@ -2053,6 +2056,23 @@ def submit_audit(aid: int):
         conn.execute(
             "UPDATE project_audits SET status=?, submitted_at=? WHERE id=?",
             (AUDIT_PENDING, _now(), aid))
+        new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (aid,)).fetchone())
+    return _audit_public(new)
+
+
+def skip_audit(aid: int):
+    """打勾人选「不提交」：draft → skipped。
+
+    项目已经做完，但这一轮不打算送审 —— 不发任何通知、不进任何人的待办，
+    只把审核单留成一条历史记录（列表里不再出现「待提交审核」标记）。
+    以后又改了内容、重新结项，会重新生成一条 draft 再问一次。
+    """
+    aid = int(aid or 0)
+    with tx() as conn:
+        row = conn.execute("SELECT * FROM project_audits WHERE id=?", (aid,)).fetchone()
+        if not row or (row["status"] or "") != AUDIT_DRAFT:
+            return None
+        conn.execute("UPDATE project_audits SET status=? WHERE id=?", (AUDIT_SKIPPED, aid))
         new = dict(conn.execute("SELECT * FROM project_audits WHERE id=?", (aid,)).fetchone())
     return _audit_public(new)
 

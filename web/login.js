@@ -25,7 +25,7 @@ async function api(path, { method = "GET", body = null } = {}) {
   const res = await fetch(path, opt);
   let data;
   try { data = await res.json(); }
-  catch (e) { throw new Error("服务返回异常（" + res.status + "）"); }
+  catch (e) { throw new Error("服务器暂时无响应，请稍后重试"); }
   if (!data.ok) throw new Error(data.error || "操作失败");
   return data;
 }

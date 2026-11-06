@@ -128,7 +128,7 @@ async function api(path, { method = "GET", body = null } = {}) {
   try {
     data = await res.json();
   } catch (e) {
-    throw new Error("服务返回异常（" + res.status + "）");
+    throw new Error("服务器暂时无响应，请稍后重试");
   }
   if (res.status === 401) {
     location.href = "/login.html";
@@ -304,10 +304,8 @@ function renderNotifBadge() {
   if (n > 0) { b.hidden = false; b.textContent = n > 99 ? "99+" : String(n); }
   else { b.hidden = true; b.textContent = "0"; }
   b.title = n > 0
-    ? (state.notif.canAudit && n > 0
-        ? (isAdmin()
-            ? `${n} 条未读（含待复审：审核员复核完成后会提醒你复审）`
-            : `${n} 条未读（含待审核，点「审核完成」后红点才消）`)
+    ? (state.notif.canAudit
+        ? (isAdmin() ? `${n} 条未读（含待复审）` : `${n} 条未读（含待审核）`)
         : `${n} 条未读`)
     : "";
   if (bell) bell.classList.toggle("has-unread", n > 0);
@@ -329,11 +327,11 @@ function notifItemHtml(n) {
       ? `<div class="ni-act"><span class="ni-done">↩︎ 已被新一轮提醒替代</span></div>`
       : n.audit_pending
         ? `<div class="ni-act"><button class="btn btn-green btn-sm" data-audit="${n.audit_id}">审核完成</button>
-             <span class="ni-hint">复核无误后点这里；<b>没点之前红点不会消</b>，以免漏审</span></div>`
+             <span class="ni-hint">确认无误后点「审核完成」</span></div>`
         : n.audit_need_confirm
           ? `<div class="ni-act"><span class="ni-done">✅ 已复核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}，等管理员复审</span></div>`
           : n.audit_status === "draft"
-            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，等打勾人重新提交审核</span></div>`
+            ? `<div class="ni-act"><span class="ni-done">↩︎ 内容已变更，待重新提交审核</span></div>`
             : `<div class="ni-act"><span class="ni-done">✅ 已审核${n.audit_auditor ? "（" + esc(n.audit_auditor) + "）" : ""}</span></div>`;
   } else if (isReview) {
     // 「某某某已审核完成，请复审」：以前这句话没有任何落点，现在挂在审核单的
@@ -343,14 +341,14 @@ function notifItemHtml(n) {
       : n.audit_need_confirm
         ? (isAdmin()
             ? `<div class="ni-act"><button class="btn btn-primary btn-sm" data-review="${n.audit_id}">复审通过</button>
-                 <span class="ni-hint">确认无误后点这里；<b>没点之前这个项目一直算「待复审」</b></span></div>`
+                 <span class="ni-hint">确认无误后点「复审通过」</span></div>`
             : `<div class="ni-act"><span class="ni-done">⏳ 已复核，等管理员复审</span></div>`)
         : n.audit_pending
-          ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，需重新审核</span></div>`
+          ? `<div class="ni-act"><span class="ni-done">↩︎ 内容已变更，待重新审核</span></div>`
           : n.audit_status === "draft"
-            ? `<div class="ni-act"><span class="ni-done">↩︎ 项目内容已变更，等打勾人重新提交审核</span></div>`
+            ? `<div class="ni-act"><span class="ni-done">↩︎ 内容已变更，待重新提交审核</span></div>`
             : n.audit_status === "void"
-              ? `<div class="ni-act"><span class="ni-done">↩︎ 项目已退回未完成，审核单已撤</span></div>`
+              ? `<div class="ni-act"><span class="ni-done">↩︎ 项目已退回未完成，审核已取消</span></div>`
               : n.audit_status === "done"
                 ? `<div class="ni-act"><span class="ni-done">✅ 已复审${n.audit_confirmer ? "（" + esc(n.audit_confirmer) + "）" : ""}</span></div>`
                 : "";
@@ -365,7 +363,7 @@ function notifItemHtml(n) {
     <div class="ni-main">
       <div class="ni-title">${notifTypePill(n.ptype)}${esc(n.title)}</div>
       ${n.body ? `<div class="ni-body">${esc(n.body)}</div>` : ""}
-      <div class="ni-meta">${tag ? `<span class="ni-tag">${esc(tag)}</span>` : ""}${n.sticky ? '<span class="ni-tag ni-lock">待办 · 未审核完成前一直提醒</span>' : ""}${aud}<span>${esc(notifTime(n.created_at))}</span></div>
+      <div class="ni-meta">${tag ? `<span class="ni-tag">${esc(tag)}</span>` : ""}${n.sticky ? '<span class="ni-tag ni-lock">待办</span>' : ""}${aud}<span>${esc(notifTime(n.created_at))}</span></div>
       ${act}
     </div>
     ${unread ? '<span class="ni-dot"></span>' : ''}
@@ -499,10 +497,10 @@ function renderNotifPanel() {
           : '<div class="notif-empty">暂时没有消息</div>'}
       </div>
       <div class="notif-foot">${isAdmin()
-        ? "项目所有平台都完成后，最后一个打勾的人会确认「是否提交审核通知」；提交后这里会收到一条告知，审核员复核完成后还会收到「审核完成」提醒。点「复审通过」才算把这轮审核走完（没点之前项目一直挂在「待审核」统计里）。要发全服提醒，去左侧「全服通告」。"
+        ? "待复审项目请点「复审通过」。发布全员提醒请用左侧「全服通告」。"
         : state.notif.canAudit
-          ? "管理员新增项目后这里会收到「项目已入库」；打勾人确认「提交审核通知」后这里会出现「待审核」，复核完点「审核完成」；📢全服通告也会送到这里。待审核项目在点「审核完成」之前，这条消息和右上角红点会一直保留（点过、全部已读、清空都消不掉）。"
-          : "管理员新增项目后，这里会收到「项目已入库」提醒；管理员发布的📢全服通告（发给你所在平台的）也会送到这里。"}</div>
+          ? "待审核项目请复核后点「审核完成」。"
+          : "新增项目与全服通告会显示在这里。"}</div>
     </div>`;
   bindNotifPanel();
   // 重建完把滚动位置放回去，并持续记录用户滚动（节流写 localStorage）
@@ -587,7 +585,7 @@ function bindNotifPanel() {
     state.notif.popups = [];
     await loadNotifications({ popup: false });   // 未读数以后端为准：待审核的仍算未读
     toast(stickyLeft
-      ? `已全部标记为已读；还有 ${stickyLeft} 个待审核项目，点「审核完成」后红点才会消`
+      ? `已全部标记为已读；还有 ${stickyLeft} 个待审核项目`
       : "已全部标记为已读");
   });
 
@@ -595,11 +593,7 @@ function bindNotifPanel() {
   const clr = panel.querySelector("[data-notif-clear]");
   if (clr) clr.addEventListener("click", async () => {
     if (!(state.notif.items || []).length) return;
-    if (!confirm("确定清空消息中心？\n\n"
-      + "· 只清空你自己的消息列表，其他账号的消息不受影响；\n"
-      + "· 「待我审核」工作台不受影响，待审核项目仍会列出；\n"
-      + "· 待审核项目的「请审核」提醒清不掉（右上角红点也不会消），点了「审核完成」才消失；\n"
-      + "· 清空后这些消息不会再弹横幅。")) return;
+    if (!confirm("确定清空消息中心？\n\n只会清空你自己的消息，待审核项目仍会列出。")) return;
     clr.disabled = true;
     try {
       await api("/api/notifications/clear", { method: "POST", body: {} });
@@ -771,7 +765,7 @@ function renderUserBox() {
       </button>
       <button type="button" data-ub="logout">
         <span class="ubm-t">退出登录</span>
-        <span class="ubm-s">结束当前会话</span>
+        <span class="ubm-s">退出当前账号</span>
       </button>
     </div>`;
   bindUserMenu();
@@ -811,11 +805,11 @@ function bindUserMenu() {
 
 const TITLES = {
   dashboard: ["仪表盘", "项目库整体概览"],
-  month: ["月末项目统计", "各平台填报当月完成项目 → 管理员一键导出"],
+  month: ["月末项目统计", "各平台月度填报与导出"],
   browse: ["项目库", "浏览与维护全部项目"],
   worklog: ["工作日志", "记录每日工作 · 仅自己可见"],
-  import: ["导入项目库", "从 Excel 批量导入 / 更新"],
-  notice: ["全服通告", "按平台定向发布提醒 · 收到的人会弹窗"],
+  import: ["导入项目库", "从 Excel 导入 / 更新"],
+  notice: ["全服通告", "按平台发布通知"],
   users: ["用户管理", "账号与平台岗位"],
   settings: ["设置", "导出目录与数据维护"],
 };
