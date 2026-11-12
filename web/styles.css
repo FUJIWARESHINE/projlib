@@ -2537,3 +2537,46 @@ td.bk-ops { display: flex; gap: 6px; align-items: center; flex-wrap: nowrap; }
 }
 /* [hidden] 会被 .btn 的 display:inline-flex 顶掉，得显式关掉 */
 .dp-bar .btn[hidden] { display: none; }
+
+/* ---------- 返修要求：逐条添加 ---------- */
+.req-box { display: flex; flex-direction: column; gap: 10px; padding-top: 2px; }
+.req-box[hidden] { display: none; }
+.req-list { display: flex; flex-direction: column; gap: 8px; }
+.req-row { display: flex; align-items: center; gap: 8px; }
+.req-no {
+  flex: 0 0 auto; min-width: 30px; height: 36px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 6px;
+  border-radius: 10px;
+  color: var(--t-repair-fg);
+  background: var(--t-repair-bg);
+  font-size: 14px; font-weight: 700; line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.req-row .req-input { flex: 1 1 auto; min-width: 0; }
+.req-del {
+  flex: 0 0 auto; width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: transparent; color: var(--text3); cursor: pointer;
+  transition: color .16s var(--ease), border-color .16s var(--ease), background .16s var(--ease);
+}
+.req-del:hover { color: var(--red); border-color: var(--red); background: var(--red-bg); }
+.req-del:active { transform: scale(.94); }
+.req-empty {
+  padding: 11px 12px;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  color: var(--text3); font-size: 12.5px;
+}
+.req-add {
+  align-self: flex-start;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px;
+  border: 1px dashed var(--t-repair-fg); border-radius: 999px;
+  background: var(--t-repair-bg); color: var(--t-repair-fg);
+  font-family: inherit; font-size: 12.5px; font-weight: 600;
+  cursor: pointer;
+  transition: transform .18s var(--ease), box-shadow .18s var(--ease), background .18s var(--ease);
+}
+.req-add:hover { transform: translateY(-1px); box-shadow: 0 6px 16px -8px var(--t-repair-fg); }
+.req-add:active { transform: translateY(0) scale(.98); }

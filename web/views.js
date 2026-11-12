@@ -827,7 +827,14 @@ function editProject(id, reload) {
         </div>
         <div class="grid3" style="margin-top:14px">
           <div class="field" style="grid-column:span 2"><label id="lb_extra">报价说明</label>
-            <input class="input" id="f_extra" value="${esc(data.extra)}"></div>
+            <input class="input" id="f_extra" value="${esc(data.extra)}">
+            <div class="req-box" id="reqBox" hidden>
+              <div class="req-list" id="reqList"></div>
+              <button type="button" class="req-add" id="reqAdd">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                添加一条返修要求</button>
+            </div></div>
           <div class="field"><label>报价金额（数字）</label>
             <input class="input money" id="f_price" value="${data.price || ""}"></div>
         </div>
@@ -845,12 +852,109 @@ function editProject(id, reload) {
       onMount(root) {
         // 「报价说明 / 返修要求」按所选类型自动换名（同一字段，语义不同）
         const lbExtra = $("#lb_extra", root);
-        const syncExtraLabel = () => {
-          const isRepair = $("#f_ptype").value === "repair";
-          lbExtra.textContent = isRepair ? "返修要求" : "报价说明（原文）";
-          $("#f_price").closest(".field").style.visibility = isRepair ? "hidden" : "visible";
+        const extraInput = $("#f_extra", root);
+        const reqBox = $("#reqBox", root);
+        const reqList = $("#reqList", root);
+
+        /* ---------- 返修要求：逐条添加，保存时拼成 ①②③ 多行文本 ----------
+           存进 extra 的格式就是「①第一条\n②第二条」，所以表格、Excel 导出
+           都是现成的 ①②③ 逐行列表，无需另存结构。
+           编辑老数据时会先剥掉行首序号再拆成条目，反复保存不会变成 ①②①②。 */
+        const CIRCLE = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚㉛㉜㉝㉞㉟";
+        const reqNum = (i) => (i < CIRCLE.length ? CIRCLE[i] : `(${i + 1})`);
+        // 剥掉行首序号：①②… / (1) / 1. / 1、(后面紧跟数字的 "1.5ml" 不动)
+        const stripNum = (s) => String(s || "")
+          .replace(/^\s*(?:[\u2460-\u2473\u3251-\u325f]|\(\d{1,2}\)|\d{1,2}\s*[.、)．](?!\d))\s*/, "");
+        const splitReqs = (text) => String(text || "").replace(/\r\n?/g, "\n")
+          .split("\n").map(stripNum).map((s) => s.trim()).filter(Boolean);
+        const reqsText = () => reqs.map((t) => String(t || "").trim())
+          .filter(Boolean).map((t, i) => reqNum(i) + t).join("\n");
+        // ⚠️ 不能拿 f_extra.value 当初始数据源：<input> 的 value 属性会把换行吃掉，
+        //    返修要求「①…\n②…」读进来会变成一整行。首屏一律用 data.extra 拆条。
+        let reqs = splitReqs(data.extra);
+        let curRepair = null;   // 上一次同步时的类型（null = 还没同步过）
+        let pushed = null;      // 上一次从条目合成进单行框的文本
+
+        const renderReqs = () => {
+          reqList.innerHTML = reqs.length
+            ? reqs.map((t, i) => `
+              <div class="req-row">
+                <span class="req-no">${reqNum(i)}</span>
+                <input class="input req-input" data-i="${i}" value="${esc(t)}"
+                  placeholder="第 ${i + 1} 条返修要求">
+                <button type="button" class="req-del" data-i="${i}" title="删除这条">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+              </div>`).join("")
+            : `<div class="req-empty">还没有返修要求，点下面的按钮一条一条添加。</div>`;
         };
-        $("#f_ptype").addEventListener("change", syncExtraLabel);
+        const reqFocus = (i) => {
+          const el = $$(".req-input", reqList)[i];
+          if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+        };
+        const addReq = (at) => {
+          const pos = (at == null || at < 0) ? reqs.length : Math.min(at, reqs.length);
+          reqs.splice(pos, 0, "");
+          renderReqs();
+          reqFocus(pos);
+        };
+
+        reqList.addEventListener("input", (e) => {
+          const inp = e.target.closest(".req-input");
+          if (inp) reqs[Number(inp.dataset.i)] = inp.value;
+        });
+        // 回车 = 接着加下一条（不用去点按钮）
+        reqList.addEventListener("keydown", (e) => {
+          if (e.key !== "Enter") return;
+          const inp = e.target.closest(".req-input");
+          if (!inp) return;
+          e.preventDefault();
+          addReq(Number(inp.dataset.i) + 1);
+        });
+        reqList.addEventListener("click", (e) => {
+          const del = e.target.closest(".req-del");
+          if (!del) return;
+          const i = Number(del.dataset.i);
+          reqs.splice(i, 1);
+          renderReqs();
+          reqFocus(Math.min(i, reqs.length - 1));
+        });
+        // 从别处复制了多行文字，粘进来直接拆成多条
+        reqList.addEventListener("paste", (e) => {
+          const inp = e.target.closest(".req-input");
+          if (!inp) return;
+          const txt = ((e.clipboardData || window.clipboardData).getData("text") || "");
+          const parts = splitReqs(txt);
+          if (parts.length < 2) return;
+          e.preventDefault();
+          const i = Number(inp.dataset.i);
+          reqs.splice(i, 1, ...parts);
+          renderReqs();
+          reqFocus(i + parts.length - 1);
+        });
+        $("#reqAdd", root).addEventListener("click", () => addReq());
+
+        const syncExtraLabel = () => {
+          const isRepair = $("#f_ptype", root).value === "repair";
+          lbExtra.textContent = isRepair ? "返修要求" : "报价说明（原文）";
+          $("#f_price", root).closest(".field").style.visibility = isRepair ? "hidden" : "visible";
+          extraInput.hidden = isRepair;
+          reqBox.hidden = !isRepair;
+          if (isRepair) {
+            // 用户可能刚在单行框里改过（值不等于我们上次推过去的），以它为准重新拆条
+            if (curRepair === false && extraInput.value !== pushed) {
+              reqs = splitReqs(extraInput.value.replace(/[;；]/g, "\n"));
+            }
+            renderReqs();
+          } else if (curRepair === true) {
+            // 切回报价说明：条目合成一段，别把填好的内容丢了
+            pushed = reqs.map((t) => String(t || "").trim()).filter(Boolean).join("；");
+            extraInput.value = pushed;
+          }
+          curRepair = isRepair;
+        };
+        $("#f_ptype", root).addEventListener("change", syncExtraLabel);
         syncExtraLabel();
         // 编号统一大写（项目库编号均为大写，避免大小写不一致导致的重复/漏配）
         const codeInput = $("#f_code", root);
@@ -862,10 +966,13 @@ function editProject(id, reload) {
           });
         }
         $("[data-save]", root).addEventListener("click", async () => {
+          const ptypeNow = $("#f_ptype", root).value;
           const payload = {
-            ptype: $("#f_ptype").value, code: $("#f_code").value.trim().toUpperCase(), name: $("#f_name").value.trim(),
+            ptype: ptypeNow, code: $("#f_code").value.trim().toUpperCase(), name: $("#f_name").value.trim(),
             cell: $("#f_cell").value, mol: $("#f_mol").value, path: $("#f_path").value, animal: $("#f_animal").value,
-            extra: $("#f_extra").value, price: parseFloat($("#f_price").value) || 0,
+            // 返修要求存成「①xxx\n②yyy」多行文本；其他类型还是单行报价说明
+            extra: ptypeNow === "repair" ? reqsText() : $("#f_extra").value,
+            price: parseFloat($("#f_price").value) || 0,
             audit_sun: $("#f_sun").value, audit_xu: $("#f_xu").value,
             send_date: $("#f_date").value.trim(), note: $("#f_note").value,
           };
